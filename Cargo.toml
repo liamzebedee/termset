@@ -1,0 +1,11 @@
+[package]
+name = "termem-demo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+arboard = "3.6.1"
+fontdue = "0.9"
+softbuffer = "0.4"
+winit = "0.30"
