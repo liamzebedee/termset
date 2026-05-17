@@ -93,7 +93,9 @@ struct Glyph {
 }
 
 struct Renderer {
-    font: fontdue::Font,
+    /// `fonts[0]` is the primary monospace face (defines cell metrics); the
+    /// rest are fallbacks consulted, in order, for glyphs it lacks.
+    fonts: Vec<fontdue::Font>,
     cell_w: usize,
     cell_h: usize,
     ascent: f32,
@@ -102,19 +104,22 @@ struct Renderer {
 
 impl Renderer {
     fn new() -> Self {
-        let bytes = load_font();
-        let font =
-            fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).expect("parse font");
+        let fonts: Vec<fontdue::Font> = load_fonts()
+            .into_iter()
+            .filter_map(|b| fontdue::Font::from_bytes(b, fontdue::FontSettings::default()).ok())
+            .collect();
+        assert!(!fonts.is_empty(), "no usable font found");
+        let primary = &fonts[0];
 
-        let lm = font
+        let lm = primary
             .horizontal_line_metrics(FONT_PX)
             .expect("font line metrics");
         let cell_h = lm.new_line_size.ceil() as usize;
         // Monospace: every cell is the advance width of a representative glyph.
-        let cell_w = font.metrics('M', FONT_PX).advance_width.ceil() as usize;
+        let cell_w = primary.metrics('M', FONT_PX).advance_width.ceil() as usize;
 
         Self {
-            font,
+            fonts,
             cell_w: cell_w.max(1),
             cell_h: cell_h.max(1),
             ascent: lm.ascent,
@@ -124,11 +129,18 @@ impl Renderer {
 
     fn glyph(&mut self, c: char) -> &Glyph {
         let ascent = self.ascent;
-        let font = &self.font;
+        let fonts = &self.fonts;
         self.cache.entry(c).or_insert_with(|| {
+            // Pick the first font that actually has this glyph; fall back to
+            // the primary (renders .notdef) if none do.
+            let font = fonts
+                .iter()
+                .find(|f| f.lookup_glyph_index(c) != 0)
+                .unwrap_or(&fonts[0]);
             let (m, bitmap) = font.rasterize(c, FONT_PX);
             // fontdue bitmap is top-down; ymin is the offset of the bitmap
-            // bottom below the baseline.
+            // bottom below the baseline. Using the primary face's ascent for
+            // every font keeps baselines aligned across faces.
             let top = (ascent - (m.height as f32 + m.ymin as f32)).round() as i32;
             Glyph {
                 w: m.width,
@@ -141,27 +153,49 @@ impl Renderer {
     }
 }
 
-/// Look for a monospace TTF: ask fontconfig, then fall back to DejaVu.
-fn load_font() -> Vec<u8> {
-    if let Ok(out) = std::process::Command::new("fc-match")
-        .args(["-f", "%{file}", "monospace"])
-        .output()
-    {
-        let path = String::from_utf8_lossy(&out.stdout);
-        let path = path.trim();
-        if !path.is_empty() {
-            if let Ok(b) = std::fs::read(path) {
-                return b;
+/// Ask fontconfig for a primary monospace face plus a set of fallback faces
+/// that cover symbols/emoji the monospace font is missing. De-dups by path
+/// and always tries DejaVu as a last resort.
+fn load_fonts() -> Vec<Vec<u8>> {
+    // fontconfig patterns, in priority order. The first must be monospace
+    // (it defines the cell grid); the rest are coverage fallbacks.
+    let patterns = [
+        "monospace",
+        "Noto Sans Symbols2",
+        "Symbola",
+        "Noto Sans Symbols",
+        "DejaVu Sans",
+        "Noto Color Emoji",
+    ];
+    let mut paths: Vec<String> = Vec::new();
+    for pat in patterns {
+        if let Ok(out) = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}", pat])
+            .output()
+        {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() && !paths.contains(&p) {
+                paths.push(p);
             }
         }
     }
-    std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
-        .expect("no monospace font found (install fontconfig or DejaVu Sans Mono)")
+    let mut fonts: Vec<Vec<u8>> = paths
+        .iter()
+        .filter_map(|p| std::fs::read(p).ok())
+        .collect();
+    if fonts.is_empty() {
+        fonts.push(
+            std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
+                .expect("no monospace font found (install fontconfig or DejaVu Sans Mono)"),
+        );
+    }
+    fonts
 }
 
-const FG: u32 = 0xCC_CC_CC;
-const BG: u32 = 0x10_10_14;
-const SEL: u32 = 0x3a_3d_4d;
+// Light mode by default.
+const FG: u32 = 0x1a_1a_1a;
+const BG: u32 = 0xff_ff_ff;
+const SEL: u32 = 0xbf_d9_f2;
 
 // --- Tab bar chrome ---------------------------------------------------------
 // Windows 2000 design *principles* (not its colours): explicit borders and
@@ -171,15 +205,15 @@ const TAB_BAR_H: usize = 26; // fixed height, in pixels
 const TAB_W: usize = 168; // fixed per-tab width
 const TAB_PAD_X: usize = 8; // text inset from the tab's left edge
 
-const STRIP_BG: u32 = 0x22_24_2c; // tab-bar background behind the tabs
-const TAB_HI: u32 = 0x4a_4e_5c; // top of an active tab's gradient
-const TAB_LO: u32 = 0x2c_2f_3a; // bottom of an active tab's gradient
-const TAB_INACT_HI: u32 = 0x2a_2c_34; // top of an inactive tab's gradient
-const TAB_INACT_LO: u32 = 0x20_22_29; // bottom of an inactive tab's gradient
-const BEVEL_LT: u32 = 0x5e_63_73; // raised highlight (top/left)
-const BEVEL_DK: u32 = 0x14_15_1a; // raised shadow (bottom/right)
-const TAB_FG: u32 = 0xD8_D8_D8; // active tab title
-const TAB_FG_DIM: u32 = 0x8a_8d_99; // inactive tab title
+const STRIP_BG: u32 = 0xc0_c0_c0; // tab-bar background behind the tabs
+const TAB_HI: u32 = 0xff_ff_ff; // top of an active tab's gradient
+const TAB_LO: u32 = 0xe4_e4_e4; // bottom of an active tab's gradient
+const TAB_INACT_HI: u32 = 0xd9_d9_d9; // top of an inactive tab's gradient
+const TAB_INACT_LO: u32 = 0xbe_be_be; // bottom of an inactive tab's gradient
+const BEVEL_LT: u32 = 0xff_ff_ff; // raised highlight (top/left)
+const BEVEL_DK: u32 = 0x80_80_80; // raised shadow (bottom/right)
+const TAB_FG: u32 = 0x1a_1a_1a; // active tab title
+const TAB_FG_DIM: u32 = 0x5a_5a_5a; // inactive tab title
 
 /// Map a terminal color to RGB. A compact, good-enough palette.
 fn rgb(color: Color, default: u32) -> u32 {
@@ -314,6 +348,7 @@ struct State {
     clipboard: Option<arboard::Clipboard>,
     mouse: (f64, f64),
     selecting: bool,
+    last_click: Option<(std::time::Instant, (f64, f64))>,
     mods: ModifiersState,
 }
 
@@ -689,13 +724,47 @@ fn draw_tab_bar(
     }
 }
 
-/// Alpha-blend `fg` over `bg` with coverage `a` (0..=255).
+/// sRGB(0..=255) -> linear-light(0..=1) lookup table. Blending glyph coverage
+/// in linear light (not raw sRGB) is what makes anti-aliased text crisp and
+/// correctly weighted instead of muddy — the single biggest text-quality win
+/// available with a CPU rasterizer.
+fn srgb_lut() -> &'static [f32; 256] {
+    static LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0.0f32; 256];
+        for (i, v) in t.iter_mut().enumerate() {
+            let c = i as f32 / 255.0;
+            *v = if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            };
+        }
+        t
+    })
+}
+
+/// linear-light(0..=1) -> sRGB(0..=255), rounded.
+fn lin_to_srgb(v: f32) -> u32 {
+    let v = v.clamp(0.0, 1.0);
+    let s = if v <= 0.003_130_8 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    };
+    (s * 255.0 + 0.5) as u32
+}
+
+/// Alpha-blend `fg` over `bg` with coverage `a` (0..=255), gamma-correct.
 fn blend(fg: u32, bg: u32, a: u32) -> u32 {
-    let mix = |s: u32, d: u32| ((s * a + d * (255 - a)) / 255) & 0xff;
-    let r = mix((fg >> 16) & 0xff, (bg >> 16) & 0xff);
-    let g = mix((fg >> 8) & 0xff, (bg >> 8) & 0xff);
-    let b = mix(fg & 0xff, bg & 0xff);
-    r << 16 | g << 8 | b
+    let lut = srgb_lut();
+    let t = a as f32 / 255.0;
+    let mix = |shift: u32| -> u32 {
+        let s = lut[((fg >> shift) & 0xff) as usize];
+        let d = lut[((bg >> shift) & 0xff) as usize];
+        lin_to_srgb(d + (s - d) * t)
+    };
+    mix(16) << 16 | mix(8) << 8 | mix(0)
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -743,6 +812,7 @@ impl ApplicationHandler<UserEvent> for App {
             clipboard: arboard::Clipboard::new().ok(),
             mouse: (0.0, 0.0),
             selecting: false,
+            last_click: None,
             mods: ModifiersState::empty(),
         });
     }
@@ -835,10 +905,23 @@ impl ApplicationHandler<UserEvent> for App {
                             if let Some(i) = st.tab_at(st.mouse.0, st.mouse.1) {
                                 self.select_tab(i);
                             } else if st.mouse.1 >= TAB_BAR_H as f64 {
+                                // A second click in the same spot within
+                                // 400ms is a double-click: select the word.
+                                let now = std::time::Instant::now();
+                                let double = st.last_click.is_some_and(|(t, p)| {
+                                    now.duration_since(t).as_millis() < 400
+                                        && (p.0 - st.mouse.0).abs() < 4.0
+                                        && (p.1 - st.mouse.1).abs() < 4.0
+                                });
+                                st.last_click = Some((now, st.mouse));
+                                let ty = if double {
+                                    SelectionType::Semantic
+                                } else {
+                                    SelectionType::Simple
+                                };
                                 let mut term = st.tabs[st.active].term.lock();
                                 let (point, side) = st.pixel_to_point(&term);
-                                term.selection =
-                                    Some(Selection::new(SelectionType::Simple, point, side));
+                                term.selection = Some(Selection::new(ty, point, side));
                                 drop(term);
                                 st.selecting = true;
                                 st.window.request_redraw();
