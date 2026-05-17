@@ -29,31 +29,37 @@ use winit::window::{Window, WindowId};
 
 const FONT_PX: f32 = 16.0;
 
-/// Userland event: the PTY parser thread woke us up because the grid changed.
+/// Userland event from a PTY parser thread. Each event carries the id of the
+/// tab it originated from so the GUI thread can route it to the right session.
 #[derive(Debug, Clone)]
 enum UserEvent {
     Wakeup,
-    Exit,
+    Exit(u64),
+    Title(u64, String),
+    ResetTitle(u64),
 }
 
-/// `EventListener` impl handed to `alacritty_terminal`. It just forwards the
-/// few events we care about onto the winit event loop so the GUI thread can
-/// react (redraw / quit). It must be `Clone + Send` because the PTY runs on
-/// its own thread.
+/// `EventListener` impl handed to `alacritty_terminal`. It forwards the few
+/// events we care about onto the winit event loop so the GUI thread can react
+/// (redraw / retitle / close tab). It must be `Clone + Send` because the PTY
+/// runs on its own thread. `id` ties events back to the owning tab.
 #[derive(Clone)]
-struct Listener(EventLoopProxy<UserEvent>);
+struct Listener {
+    proxy: EventLoopProxy<UserEvent>,
+    id: u64,
+}
 
 impl EventListener for Listener {
     fn send_event(&self, event: TermEvent) {
-        match event {
-            TermEvent::Wakeup => {
-                let _ = self.0.send_event(UserEvent::Wakeup);
-            }
+        let _ = match event {
+            TermEvent::Wakeup => self.proxy.send_event(UserEvent::Wakeup),
             TermEvent::Exit | TermEvent::ChildExit(_) => {
-                let _ = self.0.send_event(UserEvent::Exit);
+                self.proxy.send_event(UserEvent::Exit(self.id))
             }
-            _ => {}
-        }
+            TermEvent::Title(t) => self.proxy.send_event(UserEvent::Title(self.id, t)),
+            TermEvent::ResetTitle => self.proxy.send_event(UserEvent::ResetTitle(self.id)),
+            _ => Ok(()),
+        };
     }
 }
 
@@ -157,6 +163,24 @@ const FG: u32 = 0xCC_CC_CC;
 const BG: u32 = 0x10_10_14;
 const SEL: u32 = 0x3a_3d_4d;
 
+// --- Tab bar chrome ---------------------------------------------------------
+// Windows 2000 design *principles* (not its colours): explicit borders and
+// bevels, a subtle vertical gradient, compact fixed height, dense layout,
+// left-aligned titles.
+const TAB_BAR_H: usize = 26; // fixed height, in pixels
+const TAB_W: usize = 168; // fixed per-tab width
+const TAB_PAD_X: usize = 8; // text inset from the tab's left edge
+
+const STRIP_BG: u32 = 0x22_24_2c; // tab-bar background behind the tabs
+const TAB_HI: u32 = 0x4a_4e_5c; // top of an active tab's gradient
+const TAB_LO: u32 = 0x2c_2f_3a; // bottom of an active tab's gradient
+const TAB_INACT_HI: u32 = 0x2a_2c_34; // top of an inactive tab's gradient
+const TAB_INACT_LO: u32 = 0x20_22_29; // bottom of an inactive tab's gradient
+const BEVEL_LT: u32 = 0x5e_63_73; // raised highlight (top/left)
+const BEVEL_DK: u32 = 0x14_15_1a; // raised shadow (bottom/right)
+const TAB_FG: u32 = 0xD8_D8_D8; // active tab title
+const TAB_FG_DIM: u32 = 0x8a_8d_99; // inactive tab title
+
 /// Map a terminal color to RGB. A compact, good-enough palette.
 fn rgb(color: Color, default: u32) -> u32 {
     match color {
@@ -233,14 +257,60 @@ const ANSI16: [NamedColor; 16] = [
     NamedColor::BrightWhite,
 ];
 
-/// Everything that only exists once the window is created.
+/// One terminal session: its own PTY thread + VT state machine + grid size.
+struct Tab {
+    id: u64,
+    term: Arc<FairMutex<Term<Listener>>>,
+    pty_tx: EventLoopSender,
+    size: TermSize,
+    title: String,
+}
+
+/// Spawn a fresh PTY-backed terminal session sized to the current window.
+fn spawn_tab(
+    proxy: &EventLoopProxy<UserEvent>,
+    id: u64,
+    label_n: u64,
+    size: TermSize,
+    cell_w: usize,
+    cell_h: usize,
+) -> Tab {
+    let window_size = WindowSize {
+        num_cols: size.cols as u16,
+        num_lines: size.lines as u16,
+        cell_width: cell_w as u16,
+        cell_height: cell_h as u16,
+    };
+    let listener = Listener {
+        proxy: proxy.clone(),
+        id,
+    };
+    let term = Term::new(Config::default(), &size, listener.clone());
+    let term = Arc::new(FairMutex::new(term));
+    let pty = tty::new(&PtyOptions::default(), window_size, 0).expect("spawn pty");
+    let pty_loop = PtyEventLoop::new(term.clone(), listener, pty, false, false)
+        .expect("create pty event loop");
+    let pty_tx = pty_loop.channel();
+    pty_loop.spawn();
+    Tab {
+        id,
+        term,
+        pty_tx,
+        size,
+        title: format!("Terminal {label_n}"),
+    }
+}
+
+/// Everything that only exists once the window is created. The terminal area
+/// is offset down by `TAB_BAR_H` to make room for the tab strip.
 struct State {
     window: Rc<Window>,
     surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
     renderer: Renderer,
-    term: Arc<FairMutex<Term<Listener>>>,
-    pty_tx: EventLoopSender,
-    size: TermSize,
+    tabs: Vec<Tab>,
+    active: usize,
+    next_id: u64,
+    next_label: u64,
     clipboard: Option<arboard::Clipboard>,
     mouse: (f64, f64),
     selecting: bool,
@@ -248,13 +318,33 @@ struct State {
 }
 
 impl State {
+    fn tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    /// Pixel rect of tab `i` in the strip: `(x0, width)`.
+    fn tab_rect(i: usize) -> (usize, usize) {
+        (i * TAB_W, TAB_W)
+    }
+
+    /// If `x,y` falls on a tab in the strip, return its index.
+    fn tab_at(&self, x: f64, y: f64) -> Option<usize> {
+        if y < 0.0 || y >= TAB_BAR_H as f64 {
+            return None;
+        }
+        let i = (x as usize) / TAB_W;
+        (i < self.tabs.len()).then_some(i)
+    }
+
     /// Convert a pixel position in the window to a grid `Point` (accounting
-    /// for scrollback via the display offset) plus which half of the cell.
+    /// for the tab bar offset and scrollback display offset) plus cell half.
     fn pixel_to_point(&self, term: &Term<Listener>) -> (Point, Side) {
+        let size = self.tab().size;
         let cw = self.renderer.cell_w as f64;
         let ch = self.renderer.cell_h as f64;
-        let col = ((self.mouse.0 / cw) as usize).min(self.size.cols.saturating_sub(1));
-        let row = ((self.mouse.1 / ch) as usize).min(self.size.lines.saturating_sub(1));
+        let my = (self.mouse.1 - TAB_BAR_H as f64).max(0.0);
+        let col = ((self.mouse.0 / cw) as usize).min(size.cols.saturating_sub(1));
+        let row = ((my / ch) as usize).min(size.lines.saturating_sub(1));
         let offset = term.grid().display_offset() as i32;
         let line = Line(row as i32 - offset);
         let frac = (self.mouse.0 / cw).fract();
@@ -263,11 +353,19 @@ impl State {
     }
 
     fn copy_selection(&mut self) {
-        let text = self.term.lock().selection_to_string();
+        let text = self.tabs[self.active].term.lock().selection_to_string();
         if let (Some(text), Some(cb)) = (text, self.clipboard.as_mut()) {
             if !text.is_empty() {
                 let _ = cb.set_text(text);
             }
+        }
+    }
+
+    /// Grid size for the current window, with the tab bar carved off the top.
+    fn grid_size(&self, win_w: usize, win_h: usize) -> TermSize {
+        TermSize {
+            cols: (win_w / self.renderer.cell_w).max(1),
+            lines: (win_h.saturating_sub(TAB_BAR_H) / self.renderer.cell_h).max(1),
         }
     }
 }
@@ -289,7 +387,7 @@ impl App {
         let (pw, ph) = (win.width as usize, win.height as usize);
         buf.fill(BG);
 
-        let term = st.term.lock();
+        let term = st.tabs[st.active].term.lock();
         let content = term.renderable_content();
         let cursor = content.cursor.point;
         let selection = content.selection;
@@ -303,7 +401,7 @@ impl App {
             }
             let col = cell.point.column.0;
             let x0 = col * cw;
-            let y0 = line as usize * ch;
+            let y0 = TAB_BAR_H + line as usize * ch;
 
             let is_cursor = cell.point.line == cursor.line && cell.point.column == cursor.column;
             let selected = selection.map_or(false, |s| s.contains(cell.point));
@@ -346,12 +444,88 @@ impl App {
         }
 
         drop(term);
+
+        draw_tab_bar(
+            &mut buf,
+            pw,
+            ph,
+            &mut st.renderer,
+            &st.tabs,
+            st.active,
+        );
+
         buf.present().unwrap();
     }
 
     fn send(&self, bytes: Vec<u8>) {
         if let Some(st) = &self.state {
-            let _ = st.pty_tx.send(Msg::Input(bytes.into()));
+            let _ = st.tabs[st.active].pty_tx.send(Msg::Input(bytes.into()));
+        }
+    }
+
+    /// Open a new tab next to the active one and focus it.
+    fn new_tab(&mut self) {
+        let Some(st) = self.state.as_mut() else { return };
+        let win = st.window.inner_size();
+        let size = st.grid_size(win.width as usize, win.height as usize);
+        let id = st.next_id;
+        let label = st.next_label;
+        st.next_id += 1;
+        st.next_label += 1;
+        let tab = spawn_tab(
+            &self.proxy,
+            id,
+            label,
+            size,
+            st.renderer.cell_w,
+            st.renderer.cell_h,
+        );
+        let at = st.active + 1;
+        st.tabs.insert(at, tab);
+        st.active = at;
+        st.window.request_redraw();
+    }
+
+    /// Close a tab by index. Shuts its PTY down. Returns `true` when that was
+    /// the last tab and the caller should exit the app.
+    fn close_tab(&mut self, idx: usize) -> bool {
+        let Some(st) = self.state.as_mut() else {
+            return false;
+        };
+        if idx >= st.tabs.len() {
+            return false;
+        }
+        let tab = st.tabs.remove(idx);
+        let _ = tab.pty_tx.send(Msg::Shutdown);
+        if st.tabs.is_empty() {
+            return true;
+        }
+        if st.active >= st.tabs.len() {
+            st.active = st.tabs.len() - 1;
+        } else if idx < st.active {
+            st.active -= 1;
+        }
+        st.window.request_redraw();
+        false
+    }
+
+    fn select_tab(&mut self, idx: usize) {
+        if let Some(st) = self.state.as_mut() {
+            if idx < st.tabs.len() && idx != st.active {
+                st.active = idx;
+                st.window.request_redraw();
+            }
+        }
+    }
+
+    /// Cycle the focused tab by `delta` (+1 next, -1 previous), wrapping.
+    fn cycle_tab(&mut self, delta: isize) {
+        if let Some(st) = self.state.as_mut() {
+            let n = st.tabs.len() as isize;
+            if n > 1 {
+                st.active = (((st.active as isize + delta) % n + n) % n) as usize;
+                st.window.request_redraw();
+            }
         }
     }
 
@@ -392,6 +566,129 @@ fn fill_rect(
     }
 }
 
+/// Vertical gradient fill: row `y` lerps from `top` to `bot`.
+fn vgradient(buf: &mut [u32], pw: usize, ph: usize, x: usize, y: usize, w: usize, h: usize, top: u32, bot: u32) {
+    for row in 0..h {
+        let yy = y + row;
+        if yy >= ph {
+            break;
+        }
+        let t = if h > 1 { (row * 255 / (h - 1)) as u32 } else { 0 };
+        let color = blend(bot, top, t);
+        for col in 0..w {
+            let xx = x + col;
+            if xx >= pw {
+                break;
+            }
+            buf[yy * pw + xx] = color;
+        }
+    }
+}
+
+/// 1px rectangle outline.
+fn stroke_rect(buf: &mut [u32], pw: usize, ph: usize, x: usize, y: usize, w: usize, h: usize, color: u32) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    fill_rect(buf, pw, ph, x, y, w, 1, color); // top
+    fill_rect(buf, pw, ph, x, y + h - 1, w, 1, color); // bottom
+    fill_rect(buf, pw, ph, x, y, 1, h, color); // left
+    fill_rect(buf, pw, ph, x + w - 1, y, 1, h, color); // right
+}
+
+/// Draw a left-aligned monospace string, clipped to `max_w` pixels.
+fn draw_text(
+    buf: &mut [u32],
+    pw: usize,
+    ph: usize,
+    r: &mut Renderer,
+    x: usize,
+    y: usize,
+    max_w: usize,
+    text: &str,
+    color: u32,
+) {
+    let cw = r.cell_w;
+    let mut pen = x;
+    for c in text.chars() {
+        if pen + cw > x + max_w {
+            break;
+        }
+        if c != ' ' {
+            let g = r.glyph(c);
+            let (gw, gh, gl, gt) = (g.w, g.h, g.left, g.top);
+            for gy in 0..gh {
+                let py = y as i32 + gt + gy as i32;
+                if py < 0 || py as usize >= ph {
+                    continue;
+                }
+                for gx in 0..gw {
+                    let px = pen as i32 + gl + gx as i32;
+                    if px < 0 || px as usize >= pw {
+                        continue;
+                    }
+                    let a = r.cache[&c].bitmap[gy * gw + gx] as u32;
+                    if a == 0 {
+                        continue;
+                    }
+                    let idx = py as usize * pw + px as usize;
+                    buf[idx] = blend(color, buf[idx], a);
+                }
+            }
+        }
+        pen += cw;
+    }
+}
+
+/// Render the horizontal tab strip: a recessed background, then one bevelled,
+/// gradient-filled tab per session with a left-aligned title. The active tab
+/// reads "raised", inactive tabs sit flush and dimmed.
+fn draw_tab_bar(
+    buf: &mut [u32],
+    pw: usize,
+    ph: usize,
+    r: &mut Renderer,
+    tabs: &[Tab],
+    active: usize,
+) {
+    // Recessed strip background + a hard bottom border under the whole bar.
+    fill_rect(buf, pw, ph, 0, 0, pw, TAB_BAR_H, STRIP_BG);
+    fill_rect(buf, pw, ph, 0, TAB_BAR_H - 1, pw, 1, BEVEL_DK);
+
+    let text_y = (TAB_BAR_H.saturating_sub(r.cell_h)) / 2;
+    for (i, tab) in tabs.iter().enumerate() {
+        let (x0, w) = State::tab_rect(i);
+        if x0 >= pw {
+            break;
+        }
+        let is_active = i == active;
+        let h = if is_active { TAB_BAR_H } else { TAB_BAR_H - 2 };
+        let (hi, lo) = if is_active {
+            (TAB_HI, TAB_LO)
+        } else {
+            (TAB_INACT_HI, TAB_INACT_LO)
+        };
+        vgradient(buf, pw, ph, x0, 0, w, h, hi, lo);
+        // Bevel: light top/left, dark bottom/right (classic raised look).
+        stroke_rect(buf, pw, ph, x0, 0, w, h, BEVEL_DK);
+        fill_rect(buf, pw, ph, x0, 0, w, 1, BEVEL_LT);
+        fill_rect(buf, pw, ph, x0, 0, 1, h, BEVEL_LT);
+
+        let fg = if is_active { TAB_FG } else { TAB_FG_DIM };
+        draw_text(
+            buf,
+            pw,
+            ph,
+            r,
+            x0 + TAB_PAD_X,
+            text_y,
+            w.saturating_sub(TAB_PAD_X * 2),
+            &tab.title,
+            fg,
+        );
+    }
+}
+
 /// Alpha-blend `fg` over `bg` with coverage `a` (0..=255).
 fn blend(fg: u32, bg: u32, a: u32) -> u32 {
     let mix = |s: u32, d: u32| ((s * a + d * (255 - a)) / 255) & 0xff;
@@ -419,32 +716,30 @@ impl ApplicationHandler<UserEvent> for App {
         let inner = window.inner_size();
         let size = TermSize {
             cols: (inner.width as usize / renderer.cell_w).max(1),
-            lines: (inner.height as usize / renderer.cell_h).max(1),
+            lines: (inner.height as usize).saturating_sub(TAB_BAR_H) / renderer.cell_h.max(1),
         };
-        let window_size = WindowSize {
-            num_cols: size.cols as u16,
-            num_lines: size.lines as u16,
-            cell_width: renderer.cell_w as u16,
-            cell_height: renderer.cell_h as u16,
+        let size = TermSize {
+            lines: size.lines.max(1),
+            ..size
         };
 
-        let listener = Listener(self.proxy.clone());
-        let term = Term::new(Config::default(), &size, listener.clone());
-        let term = Arc::new(FairMutex::new(term));
-
-        let pty = tty::new(&PtyOptions::default(), window_size, 0).expect("spawn pty");
-        let pty_loop = PtyEventLoop::new(term.clone(), listener, pty, false, false)
-            .expect("create pty event loop");
-        let pty_tx = pty_loop.channel();
-        pty_loop.spawn();
+        let first = spawn_tab(
+            &self.proxy,
+            0,
+            1,
+            size,
+            renderer.cell_w,
+            renderer.cell_h,
+        );
 
         self.state = Some(State {
             window,
             surface,
             renderer,
-            term,
-            pty_tx,
-            size,
+            tabs: vec![first],
+            active: 0,
+            next_id: 1,
+            next_label: 2,
             clipboard: arboard::Clipboard::new().ok(),
             mouse: (0.0, 0.0),
             selecting: false,
@@ -459,7 +754,33 @@ impl ApplicationHandler<UserEvent> for App {
                     st.window.request_redraw();
                 }
             }
-            UserEvent::Exit => event_loop.exit(),
+            UserEvent::Exit(id) => {
+                let idx = self
+                    .state
+                    .as_ref()
+                    .and_then(|st| st.tabs.iter().position(|t| t.id == id));
+                if let Some(idx) = idx {
+                    if self.close_tab(idx) {
+                        event_loop.exit();
+                    }
+                }
+            }
+            UserEvent::Title(id, title) => {
+                if let Some(st) = self.state.as_mut() {
+                    if let Some(t) = st.tabs.iter_mut().find(|t| t.id == id) {
+                        t.title = title;
+                        st.window.request_redraw();
+                    }
+                }
+            }
+            UserEvent::ResetTitle(id) => {
+                if let Some(st) = self.state.as_mut() {
+                    if let Some(t) = st.tabs.iter_mut().find(|t| t.id == id) {
+                        t.title = format!("Terminal {}", t.id + 1);
+                        st.window.request_redraw();
+                    }
+                }
+            }
         }
     }
 
@@ -469,16 +790,20 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Resized(new) => {
                 if let Some(st) = self.state.as_mut() {
-                    let cols = (new.width as usize / st.renderer.cell_w).max(1);
-                    let lines = (new.height as usize / st.renderer.cell_h).max(1);
-                    st.size = TermSize { cols, lines };
-                    st.term.lock().resize(st.size);
-                    let _ = st.pty_tx.send(Msg::Resize(WindowSize {
-                        num_cols: cols as u16,
-                        num_lines: lines as u16,
+                    let size = st.grid_size(new.width as usize, new.height as usize);
+                    let ws = WindowSize {
+                        num_cols: size.cols as u16,
+                        num_lines: size.lines as u16,
                         cell_width: st.renderer.cell_w as u16,
                         cell_height: st.renderer.cell_h as u16,
-                    }));
+                    };
+                    // Every tab shares the window, so resize them all — not
+                    // just the focused one — to keep background sessions sane.
+                    for tab in &mut st.tabs {
+                        tab.size = size;
+                        tab.term.lock().resize(size);
+                        let _ = tab.pty_tx.send(Msg::Resize(ws));
+                    }
                     st.window.request_redraw();
                 }
             }
@@ -491,7 +816,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(st) = self.state.as_mut() {
                     st.mouse = (position.x, position.y);
                     if st.selecting {
-                        let mut term = st.term.lock();
+                        let mut term = st.tabs[st.active].term.lock();
                         let (point, side) = st.pixel_to_point(&term);
                         if let Some(sel) = term.selection.as_mut() {
                             sel.update(point, side);
@@ -505,13 +830,19 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(st) = self.state.as_mut() {
                     match (button, state) {
                         (MouseButton::Left, ElementState::Pressed) => {
-                            let mut term = st.term.lock();
-                            let (point, side) = st.pixel_to_point(&term);
-                            term.selection =
-                                Some(Selection::new(SelectionType::Simple, point, side));
-                            drop(term);
-                            st.selecting = true;
-                            st.window.request_redraw();
+                            // A click on the tab strip switches tabs; only
+                            // clicks in the terminal area start a selection.
+                            if let Some(i) = st.tab_at(st.mouse.0, st.mouse.1) {
+                                self.select_tab(i);
+                            } else if st.mouse.1 >= TAB_BAR_H as f64 {
+                                let mut term = st.tabs[st.active].term.lock();
+                                let (point, side) = st.pixel_to_point(&term);
+                                term.selection =
+                                    Some(Selection::new(SelectionType::Simple, point, side));
+                                drop(term);
+                                st.selecting = true;
+                                st.window.request_redraw();
+                            }
                         }
                         (MouseButton::Left, ElementState::Released) => {
                             st.selecting = false;
@@ -528,19 +859,55 @@ impl ApplicationHandler<UserEvent> for App {
                 if event.state != ElementState::Pressed {
                     return;
                 }
-                if let Some(st) = &self.state {
-                    if st.mods.control_key() && st.mods.shift_key() {
-                        match &event.logical_key {
-                            Key::Character(c) if c.eq_ignore_ascii_case("c") => {
-                                self.copy_to_clipboard();
-                                return;
-                            }
-                            Key::Character(c) if c.eq_ignore_ascii_case("v") => {
-                                self.paste();
-                                return;
-                            }
-                            _ => {}
+                let kmods = self.state.as_ref().map(|s| s.mods).unwrap_or_default();
+                if kmods.control_key() {
+                    // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs (most-recent-style).
+                    if let Key::Named(NamedKey::Tab) = &event.logical_key {
+                        self.cycle_tab(if kmods.shift_key() { -1 } else { 1 });
+                        return;
+                    }
+                }
+                if kmods.control_key() && kmods.shift_key() {
+                    match &event.logical_key {
+                        Key::Character(c) if c.eq_ignore_ascii_case("c") => {
+                            self.copy_to_clipboard();
+                            return;
                         }
+                        Key::Character(c) if c.eq_ignore_ascii_case("v") => {
+                            self.paste();
+                            return;
+                        }
+                        Key::Character(c) if c.eq_ignore_ascii_case("t") => {
+                            self.new_tab();
+                            return;
+                        }
+                        Key::Character(c) if c.eq_ignore_ascii_case("w") => {
+                            let idx = self.state.as_ref().map(|s| s.active);
+                            if let Some(idx) = idx {
+                                if self.close_tab(idx) {
+                                    event_loop.exit();
+                                }
+                            }
+                            return;
+                        }
+                        Key::Character(c) => {
+                            // Ctrl+Shift+<1..9> jumps straight to that tab.
+                            if let Some(d) = c.chars().next().and_then(|d| d.to_digit(10)) {
+                                if d >= 1 {
+                                    self.select_tab(d as usize - 1);
+                                    return;
+                                }
+                            }
+                        }
+                        Key::Named(NamedKey::PageUp) => {
+                            self.cycle_tab(-1);
+                            return;
+                        }
+                        Key::Named(NamedKey::PageDown) => {
+                            self.cycle_tab(1);
+                            return;
+                        }
+                        _ => {}
                     }
                 }
                 let mods = self.state.as_ref().map(|s| s.mods).unwrap_or_default();
