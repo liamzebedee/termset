@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=termem
+Comment=Workspace-organized mini terminal emulator
+Exec=/home/liam/Documents/projects/termem/project2/target/release/termem-demo
+Path=/home/liam/Documents/projects/termem/project2
+Icon=/home/liam/Documents/projects/termem/project2/termem.svg
+Terminal=false
+Type=Application
+Categories=Utility;TerminalEmulator;
+Keywords=terminal;workspace;tmux;sessions;
+StartupWMClass=termem

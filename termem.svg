@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" shape-rendering="crispEdges">
+  <defs>
+    <!-- Classic Windows 2000 active title bar gradient -->
+    <linearGradient id="titlebar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#0a246a"/>
+      <stop offset="100%" stop-color="#a6caf0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Drop shadow -->
+  <rect x="28" y="38" width="208" height="192" fill="#000000" opacity="0.25"/>
+
+  <!-- Window face -->
+  <rect x="22" y="30" width="208" height="192" fill="#c0c0c0"/>
+  <!-- Raised 3D window bevel -->
+  <polyline points="22,221 22,30 230,30" fill="none" stroke="#ffffff" stroke-width="2"/>
+  <polyline points="24,219 24,32 228,32" fill="none" stroke="#dfdfdf" stroke-width="1"/>
+  <polyline points="22,222 230,222 230,30" fill="none" stroke="#000000" stroke-width="2"/>
+  <polyline points="25,219 227,219 227,33" fill="none" stroke="#808080" stroke-width="2"/>
+
+  <!-- Title bar -->
+  <rect x="27" y="35" width="198" height="24" fill="url(#titlebar)"/>
+  <text x="34" y="52" font-family="Tahoma, Verdana, sans-serif" font-size="15" font-weight="bold" fill="#ffffff">termem</text>
+
+  <!-- Caption buttons (beveled gray squares) -->
+  <g shape-rendering="crispEdges">
+    <!-- minimize -->
+    <rect x="160" y="39" width="16" height="16" fill="#c0c0c0"/>
+    <polyline points="160,54 160,39 175,39" fill="none" stroke="#ffffff" stroke-width="1"/>
+    <polyline points="160,55 176,55 176,39" fill="none" stroke="#000000" stroke-width="1"/>
+    <rect x="163" y="50" width="9" height="2" fill="#000000"/>
+    <!-- maximize -->
+    <rect x="178" y="39" width="16" height="16" fill="#c0c0c0"/>
+    <polyline points="178,54 178,39 193,39" fill="none" stroke="#ffffff" stroke-width="1"/>
+    <polyline points="178,55 194,55 194,39" fill="none" stroke="#000000" stroke-width="1"/>
+    <rect x="181" y="42" width="10" height="9" fill="none" stroke="#000000" stroke-width="2"/>
+    <!-- close -->
+    <rect x="200" y="39" width="16" height="16" fill="#c0c0c0"/>
+    <polyline points="200,54 200,39 215,39" fill="none" stroke="#ffffff" stroke-width="1"/>
+    <polyline points="200,55 216,55 216,39" fill="none" stroke="#000000" stroke-width="1"/>
+    <g stroke="#000000" stroke-width="2" shape-rendering="geometricPrecision">
+      <line x1="204" y1="43" x2="212" y2="51"/>
+      <line x1="212" y1="43" x2="204" y2="51"/>
+    </g>
+  </g>
+
+  <!-- ===== Sidebar (workspace tree) ===== -->
+  <rect x="31" y="64" width="56" height="153" fill="#ffffff"/>
+  <polyline points="31,217 31,64 87,64" fill="none" stroke="#808080" stroke-width="1"/>
+  <polyline points="31,217 87,217 87,64" fill="none" stroke="#ffffff" stroke-width="1"/>
+  <g font-family="Tahoma, Verdana, sans-serif" font-size="8" fill="#000000">
+    <!-- folder: Apps -->
+    <rect x="36" y="72" width="11" height="8" fill="#f0c33a" stroke="#b9962a" stroke-width="1"/>
+    <rect x="50" y="73" width="32" height="5" fill="#5a5a5a"/>
+    <rect x="46" y="84" width="28" height="4" fill="#9a9a9a"/>
+    <!-- folder: Music (selected child highlighted) -->
+    <rect x="36" y="94" width="11" height="8" fill="#f0c33a" stroke="#b9962a" stroke-width="1"/>
+    <rect x="50" y="95" width="32" height="5" fill="#5a5a5a"/>
+    <rect x="40" y="105" width="42" height="9" fill="#0a246a"/>
+    <rect x="46" y="107" width="28" height="4" fill="#ffffff"/>
+    <rect x="46" y="118" width="24" height="4" fill="#9a9a9a"/>
+    <!-- folder: Scratch -->
+    <rect x="36" y="128" width="11" height="8" fill="#f0c33a" stroke="#b9962a" stroke-width="1"/>
+    <rect x="50" y="129" width="26" height="5" fill="#5a5a5a"/>
+  </g>
+
+  <!-- ===== Terminal pane ===== -->
+  <rect x="91" y="64" width="130" height="153" fill="#000000"/>
+  <polyline points="91,217 91,64 221,64" fill="none" stroke="#808080" stroke-width="1"/>
+  <polyline points="91,217 221,217 221,64" fill="none" stroke="#ffffff" stroke-width="1"/>
+  <g font-family="monospace" font-size="11" shape-rendering="geometricPrecision">
+    <text x="98" y="82" fill="#3cf03c">~/Music/hermes</text>
+    <text x="98" y="98" fill="#e0e0e0">$ cargo run</text>
+    <text x="98" y="118" fill="#8a8a8a">Compiling termem</text>
+    <text x="98" y="134" fill="#8a8a8a">Running target/...</text>
+    <text x="98" y="158" fill="#3cf03c">$</text>
+  </g>
+  <!-- block cursor -->
+  <rect x="107" y="149" width="9" height="12" fill="#3cf03c"/>
+</svg>

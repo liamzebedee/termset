@@ -23,16 +23,16 @@ use std::sync::Arc;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop as PtyEventLoop, EventLoopSender, Msg};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{ResizeDirection, Window, WindowId};
@@ -121,12 +121,23 @@ impl Tree {
         }
     }
 
-    /// Current text of an inspector field for `id`. `Command` is `None` on a
-    /// group (groups have no command — that field is shown disabled).
+    /// Set a leaf's working directory (the inspector / use-cwd button). No-op
+    /// on a group.
+    fn set_workdir(&mut self, id: NodeId, dir: PathBuf) {
+        if let Kind::Leaf { workdir, .. } = &mut self.nodes[id].kind {
+            *workdir = dir;
+        }
+    }
+
+    /// Current text of an inspector field for `id`. `Command`/`Directory` are
+    /// `None` on a group (it has neither — those fields render disabled).
     fn field_text(&self, id: NodeId, f: Field) -> Option<String> {
         match f {
             Field::Title => Some(self.nodes[id].name.clone()),
             Field::Command => self.leaf_spec(id).map(|(_, c)| c.to_string()),
+            Field::Dir => self
+                .leaf_spec(id)
+                .map(|(w, _)| w.display().to_string()),
         }
     }
 
@@ -190,6 +201,16 @@ impl Tree {
         self.leaves(id).into_iter().next()
     }
 
+    /// The sibling immediately before `id` among its parent's children, if any
+    /// (i.e. `None` when `id` is the first child). Used to pick what to select
+    /// after closing a session.
+    fn prev_sibling(&self, id: NodeId) -> Option<NodeId> {
+        let p = self.nodes[id].parent?;
+        let kids = &self.nodes[p].children;
+        let i = kids.iter().position(|&c| c == id)?;
+        i.checked_sub(1).map(|j| kids[j])
+    }
+
     /// `Group / Sub / Leaf` path string for the header bar.
     fn path(&self, id: NodeId) -> String {
         let mut parts = Vec::new();
@@ -227,14 +248,25 @@ fn expand_tilde(s: &str, home: &Path) -> PathBuf {
     }
 }
 
+/// Inverse of `expand_tilde`: re-collapse a `$HOME`-prefixed path back to `~`
+/// so the saved file keeps the user's tilde style.
+fn collapse_tilde(p: &Path, home: &Path) -> String {
+    match p.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => p.display().to_string(),
+    }
+}
+
 /// Parse the `workspace` file into a tree.
 ///
 /// Format: indentation depth = tree depth (one `\t` per level). Fields on a
 /// line are tab-separated; surrounding whitespace and `"`quotes`"` are
-/// stripped. A line with a working directory + command is a `Leaf`; a bare
-/// name is a `Group`. The first non-empty line (`workspaces`) is the root
-/// sentinel. Two empty groups, `Scratch` and `Transient`, are appended as
-/// homes for ad-hoc sessions.
+/// stripped. A line with >1 tab-separated field is a `Leaf` (`name`,
+/// `workdir`, optional `command`); a single bare token is a `Group`. The
+/// first non-empty line (`workspaces`) is the root sentinel. `Scratch` and
+/// `Transient` are ensured present (appended only if the file lacks them) as
+/// homes for ad-hoc sessions. Inverse of [`serialize_workspace`].
 fn parse_workspace(text: &str, home: &Path) -> Tree {
     let mut tree = Tree {
         nodes: Vec::new(),
@@ -252,44 +284,85 @@ fn parse_workspace(text: &str, home: &Path) -> Tree {
             continue;
         }
         let depth = raw.chars().take_while(|&c| c == '\t').count();
-        let rest = raw.trim_start_matches('\t');
-        let fields: Vec<String> = rest
-            .split('\t')
-            .map(|f| f.trim().trim_matches('"').trim().to_string())
-            .filter(|f| !f.is_empty())
-            .collect();
-        if fields.is_empty() {
-            continue;
-        }
         if depth == 0 {
             // The `workspaces` root line; already created.
             continue;
         }
+        let rest = raw.trim_start_matches('\t');
+        // Split on tabs *before* trimming so an empty trailing command field
+        // (`"name"\tdir\t`) still marks the line as a leaf, not a group.
+        let parts: Vec<&str> = rest.split('\t').collect();
+        let clean = |s: &str| s.trim().trim_matches('"').trim().to_string();
         let parent = *stack.get(depth - 1).unwrap_or(&root);
-        let id = if fields.len() >= 3 {
-            // name, workdir, command  -> a runnable leaf
-            let workdir = expand_tilde(&fields[1], home);
+        let id = if parts.len() == 1 {
+            let name = clean(parts[0]);
+            if name.is_empty() {
+                continue;
+            }
+            tree.push(Some(parent), name, Kind::Group, false)
+        } else {
+            let workdir = expand_tilde(&clean(parts[1]), home);
+            let command = parts.get(2).map(|s| clean(s)).unwrap_or_default();
             tree.push(
                 Some(parent),
-                fields[0].clone(),
-                Kind::Leaf {
-                    workdir,
-                    command: fields[2].clone(),
-                },
+                clean(parts[0]),
+                Kind::Leaf { workdir, command },
                 false,
             )
-        } else {
-            // bare name -> a group
-            tree.push(Some(parent), fields[0].clone(), Kind::Group, false)
         };
         stack.truncate(depth);
         stack.push(id);
     }
 
+    // Ensure the ad-hoc homes exist, but don't duplicate them when a saved
+    // file already carries them (with their persisted scratch sessions).
     for name in ["Scratch", "Transient"] {
-        tree.push(Some(root), name.into(), Kind::Group, false);
+        let present = tree.nodes[root]
+            .children
+            .iter()
+            .any(|&c| tree.nodes[c].name == name && matches!(tree.nodes[c].kind, Kind::Group));
+        if !present {
+            tree.push(Some(root), name.into(), Kind::Group, false);
+        }
     }
     tree
+}
+
+/// Serialize the tree back to the `workspace` file format. Inverse of
+/// [`parse_workspace`] (round-trips structure, names, workdirs, commands).
+/// Pure; `home` re-collapses absolute workdirs to `~`.
+fn serialize_workspace(tree: &Tree, home: &Path) -> String {
+    fn go(t: &Tree, id: NodeId, depth: usize, home: &Path, out: &mut String) {
+        for &c in &t.nodes[id].children {
+            let n = &t.nodes[c];
+            let indent = "\t".repeat(depth);
+            match &n.kind {
+                Kind::Group => {
+                    out.push_str(&format!("{indent}{}\n", n.name));
+                    go(t, c, depth + 1, home, out);
+                }
+                Kind::Leaf { workdir, command } => {
+                    let wd = collapse_tilde(workdir, home);
+                    if command.is_empty() {
+                        out.push_str(&format!("{indent}\"{}\"\t{}\n", n.name, wd));
+                    } else {
+                        // Quote a command only when it contains whitespace,
+                        // mirroring the hand-written file's style.
+                        let cmd = if command.split_whitespace().nth(1).is_some() {
+                            format!("\"{command}\"")
+                        } else {
+                            command.clone()
+                        };
+                        out.push_str(&format!("{indent}\"{}\"\t{}\t{}\n", n.name, wd, cmd));
+                    }
+                }
+                Kind::Root => {}
+            }
+        }
+    }
+    let mut out = String::from("workspaces\n");
+    go(tree, tree.root, 1, home, &mut out);
+    out
 }
 
 /// What the shell observed about a session's PTY, gathered from `/proc`.
@@ -330,6 +403,15 @@ fn already_running(obs: &Obs, command: &str) -> bool {
 enum Field {
     Title,
     Command,
+    Dir,
+}
+
+impl Field {
+    /// Inspector field order (also its row index in `field_rects`).
+    const ALL: [Field; 3] = [Field::Title, Field::Command, Field::Dir];
+    fn index(self) -> usize {
+        Field::ALL.iter().position(|&x| x == self).unwrap()
+    }
 }
 
 /// A keystroke against a single-line text field, normalized away from winit.
@@ -452,6 +534,12 @@ fn observe(shell_pid: u32) -> Obs {
         foreground: true,
         cmd: cmd.filter(|s| !s.is_empty()),
     }
+}
+
+/// The shell's *current* working directory (where `cd` at the prompt left
+/// it), via `/proc/<pid>/cwd`. Linux-only, best-effort.
+fn proc_cwd(shell_pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{shell_pid}/cwd")).ok()
 }
 
 // ===========================================================================
@@ -756,12 +844,32 @@ fn spawn_session(
     let term = Term::new(Config::default(), &size, listener.clone());
     let term = Arc::new(FairMutex::new(term));
 
+    // Don't rely on inheriting TERM: launched from the .desktop entry there
+    // is no controlling terminal, so TERM is unset and the shell's rc files
+    // fall back to a colourless prompt (and terminfo programs go monochrome).
+    // Pin a widely-present 256-colour terminfo so colours work either way.
+    let env = || {
+        HashMap::from([
+            ("TERM".to_string(), "xterm-256color".to_string()),
+            ("COLORTERM".to_string(), "truecolor".to_string()),
+        ])
+    };
     let opts = PtyOptions {
         working_directory: workdir.filter(|p| p.is_dir()),
+        env: env(),
         ..PtyOptions::default()
     };
     let pty = tty::new(&opts, window_size, 0)
-        .or_else(|_| tty::new(&PtyOptions::default(), window_size, 0))
+        .or_else(|_| {
+            tty::new(
+                &PtyOptions {
+                    env: env(),
+                    ..PtyOptions::default()
+                },
+                window_size,
+                0,
+            )
+        })
         .expect("spawn pty");
     // Capture the child shell pid before the event loop takes ownership.
     let pid = pty.child().id();
@@ -823,6 +931,9 @@ struct State {
     focus: Option<Field>,
     /// Caret position (char index) within the focused field.
     caret: usize,
+    /// Sub-line wheel remainder, so a high-resolution touchpad's many small
+    /// deltas accumulate into whole-line scrolls instead of being dropped.
+    scroll_acc: f64,
 }
 
 impl State {
@@ -946,6 +1057,41 @@ impl App {
         }
     }
 
+    /// Wheel scrolling for the shown session. `delta` is in text lines,
+    /// positive when the wheel moves away from the user (scroll back into
+    /// history). Fractional input (touchpads) is accumulated so nothing is
+    /// lost. On the primary screen this walks the scrollback buffer; on the
+    /// alternate screen (full-screen TUIs — `less`, `man`, `vim`, which keep
+    /// no scrollback) it instead sends arrow keys, the usual "alternate
+    /// scroll".
+    fn scroll(&mut self, delta: f64) {
+        let Some(st) = self.state.as_mut() else { return };
+        let Some(node) = st.shown() else { return };
+        st.scroll_acc += delta;
+        let lines = st.scroll_acc.trunc() as i32;
+        if lines == 0 {
+            return;
+        }
+        st.scroll_acc -= lines as f64;
+
+        let session = &st.sessions[&node];
+        let mut term = session.tab.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            drop(term);
+            // Up arrow on scroll-back, Down on scroll-forward.
+            let seq: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
+            let mut bytes = Vec::with_capacity(seq.len() * lines.unsigned_abs() as usize);
+            for _ in 0..lines.unsigned_abs() {
+                bytes.extend_from_slice(seq);
+            }
+            let _ = session.tab.pty_tx.send(Msg::Input(bytes.into()));
+        } else {
+            term.scroll_display(Scroll::Delta(lines));
+            drop(term);
+            st.window.request_redraw();
+        }
+    }
+
     /// Observe every live session's `/proc` state so the pure planners can
     /// decide what's already running.
     fn observations(&self) -> HashMap<NodeId, Obs> {
@@ -1004,6 +1150,7 @@ impl App {
         st.tree.nodes[group].expanded = true;
         st.selected = node;
         self.spawn_for(node);
+        self.save_workspace();
         if let Some(st) = &self.state {
             st.window.request_redraw();
         }
@@ -1018,13 +1165,20 @@ impl App {
             let _ = s.tab.pty_tx.send(Msg::Shutdown);
             st.id_of.retain(|_, &mut v| v != node);
         }
-        if st.tree.nodes[node].dynamic {
+        let removed = st.tree.nodes[node].dynamic;
+        if removed {
             if let Some(p) = st.tree.nodes[node].parent {
+                // Land on the preceding session; fall back to the parent only
+                // when there is no sibling before this one.
+                let target = st.tree.prev_sibling(node).unwrap_or(p);
                 st.tree.nodes[p].children.retain(|&c| c != node);
-                st.selected = p;
+                st.selected = target;
             }
         }
         st.window.request_redraw();
+        if removed {
+            self.save_workspace();
+        }
     }
 
     /// Reflow every session's grid to the current terminal area. The window
@@ -1060,19 +1214,43 @@ impl App {
         self.relayout();
     }
 
-    /// Focus an inspector field, placing the caret under the click. `Command`
-    /// on a group is not editable, so focus is refused there.
+    /// Persist the tree to the `workspace` file so new sessions, renamed
+    /// titles and edited commands survive a restart. Best-effort: a write
+    /// failure is non-fatal.
+    fn save_workspace(&self) {
+        if let Some(st) = &self.state {
+            let text = serialize_workspace(&st.tree, &home_dir());
+            let _ = std::fs::write("workspace", text);
+        }
+    }
+
+    /// Pin the selected leaf's default working directory to its session's
+    /// *current* shell cwd (where you've `cd`'d to), then persist.
+    fn use_current_cwd(&mut self) {
+        let Some(st) = self.state.as_mut() else { return };
+        let sel = st.selected;
+        let Some(pid) = st.sessions.get(&sel).map(|s| s.shell_pid) else {
+            return;
+        };
+        if let Some(cwd) = proc_cwd(pid) {
+            st.tree.set_workdir(sel, cwd);
+            st.window.request_redraw();
+            self.save_workspace();
+        }
+    }
+
+    /// Focus an inspector field, placing the caret under the click. Fields
+    /// with no text for the selection (Command/Dir on a group) refuse focus.
     fn focus_field(&mut self, f: Field, click_x: f64) {
         let Some(st) = self.state.as_mut() else { return };
-        if f == Field::Command && st.tree.field_text(st.selected, Field::Command).is_none() {
+        let Some(text) = st.tree.field_text(st.selected, f) else {
             st.focus = None;
             return;
-        }
-        let text = st.tree.field_text(st.selected, f).unwrap_or_default();
+        };
         let fr = field_rects(
             st.window.inner_size().width as usize,
             st.renderer.cell_h,
-        )[if f == Field::Title { 0 } else { 1 }];
+        )[f.index()];
         let rel = (click_x - (fr.0 + 5) as f64).max(0.0);
         let idx = (rel / st.renderer.cell_w as f64).round() as usize;
         st.focus = Some(f);
@@ -1094,16 +1272,20 @@ impl App {
                 return true;
             }
             Key::Named(NamedKey::Tab) => {
-                // Hop between the two fields (skip Command on a group).
-                let next = if f == Field::Title { Field::Command } else { Field::Title };
-                st.focus = (st.tree.field_text(sel, next).is_some()
-                    || next == Field::Title)
-                    .then_some(next);
+                // Hop to the next field that exists for this node (groups
+                // only have Title), wrapping around.
+                let order = Field::ALL;
+                let cur = f.index();
+                let next = (1..=order.len())
+                    .map(|k| order[(cur + k) % order.len()])
+                    .find(|&nf| st.tree.field_text(sel, nf).is_some())
+                    .unwrap_or(Field::Title);
                 st.caret = st
-                    .focus
-                    .and_then(|nf| st.tree.field_text(sel, nf))
+                    .tree
+                    .field_text(sel, next)
                     .map(|t| t.chars().count())
                     .unwrap_or(0);
+                st.focus = Some(next);
                 st.window.request_redraw();
                 return true;
             }
@@ -1128,9 +1310,13 @@ impl App {
                     *c = next;
                 }
             }
+            // Absolute input is left as-is (stable caret); a typed leading
+            // `~` is expanded on commit so `~/foo` still resolves.
+            Field::Dir => st.tree.set_workdir(sel, expand_tilde(&next, &home_dir())),
         }
         st.caret = caret;
         st.window.request_redraw();
+        self.save_workspace();
         true
     }
 
@@ -1156,17 +1342,22 @@ impl App {
         // --- terminal area --------------------------------------------------
         if let Some(node) = shown {
             let term = st.sessions[&node].tab.term.lock();
+            // `display_iter` numbers scrollback with negative grid lines; the
+            // visible viewport is shifted by the scroll offset, so a grid
+            // line maps to on-screen row `line + display_offset`.
+            let offset = term.grid().display_offset() as i32;
+            let rows = st.sessions[&node].tab.size.lines as i32;
             let content = term.renderable_content();
             let cursor = content.cursor.point;
             let selection = content.selection;
             for cell in content.display_iter {
-                let line = cell.point.line.0;
-                if line < 0 {
+                let row = cell.point.line.0 + offset;
+                if row < 0 || row >= rows {
                     continue;
                 }
                 let col = cell.point.column.0;
                 let x0 = SIDEBAR_W + col * cw;
-                let y0 = HEADER_H + line as usize * ch;
+                let y0 = HEADER_H + row as usize * ch;
                 let is_cursor =
                     cell.point.line == cursor.line && cell.point.column == cursor.column;
                 let selected = selection.is_some_and(|s| s.contains(cell.point));
@@ -1258,7 +1449,7 @@ impl App {
             (bmax, if maxed { "\u{2750}" } else { "\u{25a1}" }), // ▢ / ❐
             (bclose, "\u{2715}"),                              // ✕  close
         ] {
-            draw_button(&mut buf, pw, ph, &mut st.renderer, rect, label, false);
+            draw_button(&mut buf, pw, ph, &mut st.renderer, rect, label, false, true);
         }
 
         // --- sidebar tree ---------------------------------------------------
@@ -1277,6 +1468,7 @@ impl App {
 
         // --- right inspector ------------------------------------------------
         if st.inspector {
+            let can_use_cwd = st.tree.is_leaf(sel) && st.sessions.contains_key(&sel);
             draw_inspector(
                 &mut buf,
                 pw,
@@ -1286,6 +1478,7 @@ impl App {
                 sel,
                 st.focus,
                 st.caret,
+                can_use_cwd,
             );
         }
 
@@ -1298,9 +1491,18 @@ impl App {
     }
 
     fn send(&self, bytes: Vec<u8>) {
-        if let Some(node) = self.state.as_ref().and_then(|s| s.shown()) {
-            self.send_to(node, bytes);
+        let Some(st) = self.state.as_ref() else { return };
+        let Some(node) = st.shown() else { return };
+        // Typing snaps back to the prompt if we were scrolled up, like xterm.
+        let mut term = st.sessions[&node].tab.term.lock();
+        if term.grid().display_offset() != 0 {
+            term.scroll_display(Scroll::Bottom);
+            drop(term);
+            st.window.request_redraw();
+        } else {
+            drop(term);
         }
+        self.send_to(node, bytes);
     }
 
     fn copy_to_clipboard(&mut self) {
@@ -1530,9 +1732,18 @@ fn ctx_item_at(m: &CtxMenu, x: f64, y: f64) -> Option<usize> {
     Some(if (y - my) < ROW_H as f64 { 0 } else { 1 })
 }
 
-/// A Win2k push-button: raised by default, sunken+inset when `pressed`
-/// (used for the latched "Properties" toggle and the window controls).
-fn draw_button(buf: &mut [u32], pw: usize, ph: usize, r: &mut Renderer, rect: Rect, label: &str, pressed: bool) {
+/// A Win2k push-button: raised by default, sunken+inset when `pressed`, dim
+/// when `!enabled`. Used for the window controls and the use-cwd action.
+fn draw_button(
+    buf: &mut [u32],
+    pw: usize,
+    ph: usize,
+    r: &mut Renderer,
+    rect: Rect,
+    label: &str,
+    pressed: bool,
+    enabled: bool,
+) {
     let (x, y, w, h) = rect;
     if pressed {
         fill_rect(buf, pw, ph, x, y, w, h, PANEL_LO);
@@ -1550,7 +1761,7 @@ fn draw_button(buf: &mut [u32], pw: usize, ph: usize, r: &mut Renderer, rect: Re
     let off = pressed as usize;
     let tx = x + w.saturating_sub(tw) / 2 + off;
     let ty = y + h.saturating_sub(r.cell_h) / 2 + off;
-    draw_text(buf, pw, ph, r, tx, ty, w, label, INK);
+    draw_text(buf, pw, ph, r, tx, ty, w, label, if enabled { INK } else { INK_DIM });
 }
 
 /// A small square info icon (1px border, a drawn "i"). Not a button: no
@@ -1608,8 +1819,8 @@ fn draw_field(
 }
 
 /// The right inspector pane: a recessed panel echoing the sidebar, with the
-/// selected node's path, an editable Title and Default-command field, and the
-/// (read-only) working directory.
+/// selected node's path and editable Title / Default-command / Working-dir
+/// fields, plus a "use current working dir" button.
 fn draw_inspector(
     buf: &mut [u32],
     pw: usize,
@@ -1619,6 +1830,7 @@ fn draw_inspector(
     sel: NodeId,
     focus: Option<Field>,
     caret: usize,
+    can_use_cwd: bool,
 ) {
     let px = panel_x(pw);
     fill_rect(buf, pw, ph, px, 0, RPANEL_W, ph, STRIP_BG);
@@ -1641,52 +1853,38 @@ fn draw_inspector(
     );
 
     let cell_h = r.cell_h;
-    let [tb, cb] = field_rects(pw, cell_h);
+    let rects = field_rects(pw, cell_h);
     let lab_y = |by: usize| by.saturating_sub(cell_h + 4);
-    draw_text(buf, pw, ph, r, tb.0, lab_y(tb.1), RPANEL_W, "Title", INK);
-    draw_field(
+    for f in Field::ALL {
+        let rect = rects[f.index()];
+        let label = match f {
+            Field::Title => "Title",
+            Field::Command => "Default command",
+            Field::Dir => "Working directory",
+        };
+        draw_text(buf, pw, ph, r, rect.0, lab_y(rect.1), RPANEL_W, label, INK);
+        match tree.field_text(sel, f) {
+            Some(t) => draw_field(buf, pw, ph, r, rect, &t, focus == Some(f), caret, true),
+            None => {
+                let dis = match f {
+                    Field::Command => "(group \u{2014} no command)",
+                    Field::Dir => "(group \u{2014} no directory)",
+                    Field::Title => "",
+                };
+                draw_field(buf, pw, ph, r, rect, dis, false, 0, false);
+            }
+        }
+    }
+    draw_button(
         buf,
         pw,
         ph,
         r,
-        tb,
-        &tree.field_text(sel, Field::Title).unwrap_or_default(),
-        focus == Some(Field::Title),
-        caret,
-        true,
+        usecwd_btn(pw, cell_h),
+        "Use current working dir",
+        false,
+        can_use_cwd,
     );
-
-    draw_text(buf, pw, ph, r, cb.0, lab_y(cb.1), RPANEL_W, "Default command", INK);
-    match tree.field_text(sel, Field::Command) {
-        Some(cmd) => draw_field(
-            buf,
-            pw,
-            ph,
-            r,
-            cb,
-            &cmd,
-            focus == Some(Field::Command),
-            caret,
-            true,
-        ),
-        None => draw_field(buf, pw, ph, r, cb, "(group \u{2014} no command)", false, 0, false),
-    }
-
-    if let Some((wd, _)) = tree.leaf_spec(sel) {
-        let dy = cb.1 + cb.3 + 16;
-        draw_text(buf, pw, ph, r, cb.0, dy, RPANEL_W, "Directory", INK);
-        draw_text(
-            buf,
-            pw,
-            ph,
-            r,
-            cb.0,
-            dy + r.cell_h + 4,
-            RPANEL_W - 24,
-            &wd.to_string_lossy(),
-            INK_DIM,
-        );
-    }
 }
 
 // --- chrome geometry -------------------------------------------------------
@@ -1727,8 +1925,9 @@ fn info_btn() -> Rect {
     (6, HEADER_H + (INFO_H - s) / 2, s, s)
 }
 
-/// `[title box, command box]` inside the inspector pane.
-fn field_rects(pw: usize, cell_h: usize) -> [Rect; 2] {
+/// `[title, command, directory]` boxes inside the inspector pane, in
+/// `Field::ALL` order (so `Field::index` is the row index here).
+fn field_rects(pw: usize, cell_h: usize) -> [Rect; 3] {
     let px = panel_x(pw);
     let pad = 12;
     let fx = px + pad;
@@ -1736,11 +1935,20 @@ fn field_rects(pw: usize, cell_h: usize) -> [Rect; 2] {
     let bh = cell_h + 8;
     // Each box sits exactly `cell_h + 4` below its label (see `lab_y`), and
     // the first label clears the path line under the PROPERTIES head.
-    let title_lab = HEADER_H + 8 + cell_h + 10;
-    let title_y = title_lab + cell_h + 4;
-    let cmd_lab = title_y + bh + 16;
-    let cmd_y = cmd_lab + cell_h + 4;
-    [(fx, title_y, fw, bh), (fx, cmd_y, fw, bh)]
+    let lab0 = HEADER_H + 8 + cell_h + 10;
+    let y0 = lab0 + cell_h + 4;
+    let step = bh + 16 + cell_h + 4; // box -> next label -> next box
+    [
+        (fx, y0, fw, bh),
+        (fx, y0 + step, fw, bh),
+        (fx, y0 + 2 * step, fw, bh),
+    ]
+}
+
+/// The "Use current working dir" button, just below the directory box.
+fn usecwd_btn(pw: usize, cell_h: usize) -> Rect {
+    let (x, y, w, h) = field_rects(pw, cell_h)[Field::Dir.index()];
+    (x, y + h + 8, w, h)
 }
 
 /// Which resize grip (if any) the point is in, for a borderless window.
@@ -1819,14 +2027,21 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // No OS title bar: we draw our own in the header row to reclaim that
         // strip of screen.
+        let mut attrs = Window::default_attributes()
+            .with_title("termem")
+            .with_decorations(false);
+        // Pin a stable WM class / Wayland app_id so the desktop entry's
+        // `StartupWMClass=termem` binds the launcher icon to this window
+        // (see scripts/install-icon.sh).
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            attrs = WindowAttributesExtX11::with_name(attrs, "termem", "termem");
+            attrs = WindowAttributesExtWayland::with_name(attrs, "termem", "termem");
+        }
         let window = Rc::new(
-            event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("termem")
-                        .with_decorations(false),
-                )
-                .expect("create window"),
+            event_loop.create_window(attrs).expect("create window"),
         );
         let renderer = Renderer::new();
         let ctx = softbuffer::Context::new(window.clone()).unwrap();
@@ -1857,6 +2072,7 @@ impl ApplicationHandler<UserEvent> for App {
             inspector: false,
             focus: None,
             caret: 0,
+            scroll_acc: 0.0,
         };
         let size = st.grid_size(inner.width as usize, inner.height as usize);
 
@@ -1894,6 +2110,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Exit(id) => {
+                let mut removed_dynamic = false;
                 if let Some(st) = self.state.as_mut() {
                     if let Some(&node) = st.id_of.get(&id) {
                         if let Some(s) = st.sessions.remove(&node) {
@@ -1903,15 +2120,20 @@ impl ApplicationHandler<UserEvent> for App {
                         // A scratch tab disappears when its shell exits; a
                         // spec leaf stays so Start can bring it back.
                         if st.tree.nodes[node].dynamic {
+                            removed_dynamic = true;
                             if let Some(p) = st.tree.nodes[node].parent {
+                                let target = st.tree.prev_sibling(node).unwrap_or(p);
                                 st.tree.nodes[p].children.retain(|&c| c != node);
                                 if st.selected == node {
-                                    st.selected = p;
+                                    st.selected = target;
                                 }
                             }
                         }
                         st.window.request_redraw();
                     }
+                }
+                if removed_dynamic {
+                    self.save_workspace();
                 }
             }
             UserEvent::Title(id, title) => {
@@ -2013,11 +2235,13 @@ impl ApplicationHandler<UserEvent> for App {
                             && mx >= panel_x(pw) as f64
                         {
                             let ch = self.state.as_ref().unwrap().renderer.cell_h;
-                            let [tb, cb] = field_rects(pw, ch);
-                            if hit(tb, mx, my) {
-                                self.focus_field(Field::Title, mx);
-                            } else if hit(cb, mx, my) {
-                                self.focus_field(Field::Command, mx);
+                            let rects = field_rects(pw, ch);
+                            if let Some(f) =
+                                Field::ALL.into_iter().find(|f| hit(rects[f.index()], mx, my))
+                            {
+                                self.focus_field(f, mx);
+                            } else if hit(usecwd_btn(pw, ch), mx, my) {
+                                self.use_current_cwd();
                             } else if let Some(st) = self.state.as_mut() {
                                 st.focus = None;
                                 st.window.request_redraw();
@@ -2114,6 +2338,19 @@ impl ApplicationHandler<UserEvent> for App {
                     (MouseButton::Middle, ElementState::Pressed) => self.paste(),
                     _ => {}
                 }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // A wheel notch ≈ 3 lines; a high-resolution touchpad reports
+                // pixels, converted to lines by the cell height. Positive =
+                // away from the user = back into scrollback.
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y as f64 * 3.0,
+                    MouseScrollDelta::PixelDelta(p) => {
+                        let ch = self.state.as_ref().map(|s| s.renderer.cell_h).unwrap_or(1);
+                        p.y / ch.max(1) as f64
+                    }
+                };
+                self.scroll(lines);
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
@@ -2252,8 +2489,29 @@ fn main() {
 mod tests {
     use super::*;
 
+    // A fixed fixture in the original hand-written style. Tests must not
+    // depend on the live `workspace` file — the app rewrites it (persisted
+    // sessions, edits), so coupling tests to it makes them flaky.
+    const FIXTURE: &str = "workspaces
+\tApps
+\t\t\"qwen\"\t/home/liam/.apps\t./run-llama.sh
+\tMusic
+\t\t\"Hermes chat\"\t~/Music\thermes
+\t\t\"Wanted music\"\t~/Music\t\"nano wanted\"
+\tDiabetes
+\t\t\"Meal planner\"\t~/Documents/projects/diabetes/mealplanner\t \"bun run main.ts\"
+\t\t\"Sugar tracker\"\t/home/liam/Documents/projects/diabetes/sugar\t./run.sh
+\tMorphology
+\t\t\"morpheus\"\t~/Documents/projects/morpheus\tbash
+\tHTGAA
+\t\t\"website\"\t/home/liam/Documents/projects/webpages\tbash
+\tStudy
+\t\t\"Papers\"\t~/Documents/papers\tbash
+\t\t\"Podcasts\"\t/home/liam/Dropbox/podcast-learn\tbash
+";
+
     fn tree() -> Tree {
-        parse_workspace(include_str!("../workspace"), Path::new("/home/u"))
+        parse_workspace(FIXTURE, Path::new("/home/u"))
     }
 
     fn group(t: &Tree, name: &str) -> NodeId {
@@ -2311,6 +2569,19 @@ mod tests {
         let leaf = t.leaves(music)[0];
         assert_eq!(t.group_for_new(leaf), music); // leaf -> its group
         assert_eq!(t.group_for_new(music), music); // group -> itself
+    }
+
+    #[test]
+    fn closing_selects_preceding_sibling_then_parent() {
+        let t = tree();
+        let music = group(&t, "Music");
+        let [a, b] = t.leaves(music)[..] else { panic!() };
+        // Closing the 2nd session lands on the 1st (the preceding one)...
+        assert_eq!(t.prev_sibling(b), Some(a));
+        // ...and closing the 1st has no preceding sibling, so the caller
+        // falls back to the parent group.
+        assert_eq!(t.prev_sibling(a), None);
+        assert_eq!(t.prev_sibling(a).unwrap_or(music), music);
     }
 
     #[test]
@@ -2389,8 +2660,105 @@ mod tests {
         let leaf = t.leaves(music)[0];
         assert_eq!(t.field_text(leaf, Field::Title).as_deref(), Some("Hermes chat"));
         assert_eq!(t.field_text(leaf, Field::Command).as_deref(), Some("hermes"));
-        // A group has a title but no command (that field renders disabled).
+        assert_eq!(
+            t.field_text(leaf, Field::Dir).as_deref(),
+            Some("/home/u/Music")
+        );
+        // A group has a title but no command/dir (those render disabled).
         assert_eq!(t.field_text(music, Field::Title).as_deref(), Some("Music"));
         assert_eq!(t.field_text(music, Field::Command), None);
+        assert_eq!(t.field_text(music, Field::Dir), None);
+
+        // Editing the directory field round-trips back into the tree and the
+        // saved file (a typed leading `~` expands on commit).
+        let mut t = t;
+        t.set_workdir(leaf, expand_tilde("~/elsewhere", Path::new("/home/u")));
+        assert_eq!(
+            t.field_text(leaf, Field::Dir).as_deref(),
+            Some("/home/u/elsewhere")
+        );
+        let reloaded =
+            parse_workspace(&serialize_workspace(&t, Path::new("/home/u")), Path::new("/home/u"));
+        let rleaf = reloaded.leaves(group(&reloaded, "Music"))[0];
+        assert_eq!(reloaded.leaf_spec(rleaf).unwrap().0, Path::new("/home/u/elsewhere"));
+    }
+
+    /// Flatten the tree to a comparable shape: (depth, name, kind, workdir,
+    /// command) per node in DFS order.
+    fn shape(t: &Tree, home: &Path) -> Vec<(usize, String, &'static str, String, String)> {
+        fn go(
+            t: &Tree,
+            id: NodeId,
+            d: usize,
+            home: &Path,
+            out: &mut Vec<(usize, String, &'static str, String, String)>,
+        ) {
+            for &c in &t.nodes[id].children {
+                let n = &t.nodes[c];
+                let row = match &n.kind {
+                    Kind::Group => (d, n.name.clone(), "g", String::new(), String::new()),
+                    Kind::Leaf { workdir, command } => (
+                        d,
+                        n.name.clone(),
+                        "l",
+                        collapse_tilde(workdir, home),
+                        command.clone(),
+                    ),
+                    Kind::Root => continue,
+                };
+                out.push(row);
+                go(t, c, d + 1, home, out);
+            }
+        }
+        let mut v = Vec::new();
+        go(t, t.root, 0, home, &mut v);
+        v
+    }
+
+    #[test]
+    fn workspace_round_trips_through_disk_format() {
+        let home = Path::new("/home/u");
+        let t1 = parse_workspace(FIXTURE, home);
+        let text = serialize_workspace(&t1, home);
+        let t2 = parse_workspace(&text, home);
+        // Re-parsing the serialized form yields the same tree...
+        assert_eq!(shape(&t1, home), shape(&t2, home));
+        // ...and the synthetic homes are present exactly once (not doubled
+        // by the round trip).
+        let count = |t: &Tree, name: &str| {
+            t.nodes[t.root]
+                .children
+                .iter()
+                .filter(|&&c| t.nodes[c].name == name)
+                .count()
+        };
+        assert_eq!(count(&t2, "Scratch"), 1);
+        assert_eq!(count(&t2, "Transient"), 1);
+    }
+
+    #[test]
+    fn saved_scratch_session_reloads_as_a_leaf() {
+        // A new scratch tab has an empty command; it must come back as a
+        // leaf (with its cwd), not get misread as a group.
+        let home = Path::new("/home/u");
+        let mut t = parse_workspace("workspaces\n\tScratch\n", home);
+        let scratch = group(&t, "Scratch");
+        t.push(
+            Some(scratch),
+            "Scratch 1".into(),
+            Kind::Leaf {
+                workdir: PathBuf::from("/home/u/work"),
+                command: String::new(),
+            },
+            true,
+        );
+        let reloaded = parse_workspace(&serialize_workspace(&t, home), home);
+        let s = group(&reloaded, "Scratch");
+        let leaves = reloaded.leaves(s);
+        assert_eq!(leaves.len(), 1);
+        let (wd, cmd) = reloaded.leaf_spec(leaves[0]).unwrap();
+        assert_eq!(reloaded.nodes[leaves[0]].name, "Scratch 1");
+        assert_eq!(wd, Path::new("/home/u/work"));
+        assert_eq!(cmd, "");
     }
 }
