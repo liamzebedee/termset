@@ -7,5 +7,6 @@ edition = "2024"
 alacritty_terminal = "0.26.0"
 arboard = "3.6.1"
 fontdue = "0.9"
+image = { version = "0.25", default-features = false, features = ["png"] }
 softbuffer = "0.4"
 winit = "0.30"

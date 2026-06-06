@@ -27,6 +27,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
@@ -40,6 +41,14 @@ use winit::window::{ResizeDirection, Window, WindowId};
 pub mod testkit;
 
 const FONT_PX: f32 = 16.0;
+
+/// Empty-terminal hint, with the platform's own "new shell" shortcut.
+#[cfg(target_os = "macos")]
+const NO_SESSION_HINT: &str =
+    "No session here. Right-click a node \u{2192} Start, or \u{2318}T for a shell.";
+#[cfg(not(target_os = "macos"))]
+const NO_SESSION_HINT: &str =
+    "No session here. Right-click a node \u{2192} Start, or Ctrl+Shift+T for a shell.";
 
 // ===========================================================================
 // core — the workspace as a pure rose tree
@@ -504,44 +513,228 @@ fn plan_stop(tree: &Tree, has_session: &dyn Fn(NodeId) -> bool, target: NodeId) 
         .collect()
 }
 
-/// Walk `/proc` to see what a PTY's shell is doing. Linux-only and best-effort
-/// — any failure degrades to "nothing observed" (`Obs::default`), which the
-/// planner treats as "not running".
-fn observe(shell_pid: u32) -> Obs {
-    fn children(pid: u32) -> Vec<u32> {
-        std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
-            .ok()
-            .map(|s| s.split_whitespace().filter_map(|x| x.parse().ok()).collect())
-            .unwrap_or_default()
-    }
-    // Descend to the deepest foreground descendant of the shell.
-    let mut cur = shell_pid;
-    loop {
-        match children(cur).first() {
-            Some(&c) => cur = c,
-            None => break,
+/// A window-level command triggered by a keyboard shortcut, independent of the
+/// physical keys that produce it. The keymap is OS-specific (see
+/// [`match_shortcut`]); everything downstream of it is not — this is the
+/// abstraction that lets the same actions wear ⌘ on macOS and Ctrl+Shift
+/// elsewhere.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shortcut {
+    Copy,
+    Paste,
+    NewTab,
+    CloseTab,
+    SelectPrev,
+    SelectNext,
+    Collapse,
+    Expand,
+    Start,
+    Stop,
+}
+
+/// Map a modified keystroke to a [`Shortcut`], or `None` to pass it through to
+/// the terminal. Bindings are the intuitive ones for each platform:
+///
+/// * **macOS** uses ⌘ (Command), like every native mac app: ⌘C copy, ⌘V paste,
+///   ⌘T new tab, ⌘W close, ⌘↑/⌘↓ select previous/next tree node, ⌘←/⌘→
+///   collapse/expand the selected group, ⌘R run/start, ⌘. stop. ⌘ never
+///   collides with the shell's own Ctrl- control codes, so all of these are
+///   safe to claim.
+/// * **Elsewhere** there is no ⌘, so the terminal convention Ctrl+Shift is used
+///   (plain Ctrl+C etc. must stay free for the shell): Ctrl+Shift+C/V/T/W for
+///   copy/paste/new/close, Ctrl+Shift+↑/↓ select previous/next node,
+///   Ctrl+Shift+←/→ collapse/expand the selected group, Ctrl+Shift+S start,
+///   Ctrl+Shift+X stop.
+fn match_shortcut(mods: ModifiersState, key: &Key) -> Option<Shortcut> {
+    let ch = |name: &str| matches!(key, Key::Character(c) if c.eq_ignore_ascii_case(name));
+    #[cfg(target_os = "macos")]
+    {
+        if !mods.super_key() {
+            return None;
         }
+        if ch(".") {
+            return Some(Shortcut::Stop); // ⌘. — the mac "cancel" gesture
+        }
+        Some(match key {
+            _ if ch("c") => Shortcut::Copy,
+            _ if ch("v") => Shortcut::Paste,
+            _ if ch("t") => Shortcut::NewTab,
+            _ if ch("w") => Shortcut::CloseTab,
+            Key::Named(NamedKey::ArrowUp) => Shortcut::SelectPrev,
+            Key::Named(NamedKey::ArrowDown) => Shortcut::SelectNext,
+            Key::Named(NamedKey::ArrowLeft) => Shortcut::Collapse,
+            Key::Named(NamedKey::ArrowRight) => Shortcut::Expand,
+            _ if ch("r") => Shortcut::Start,
+            _ => return None,
+        })
     }
-    if cur == shell_pid {
-        return Obs::default();
-    }
-    let cmd = std::fs::read(format!("/proc/{cur}/cmdline")).ok().map(|b| {
-        b.split(|&c| c == 0)
-            .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect::<Vec<_>>()
-            .join(" ")
-    });
-    Obs {
-        foreground: true,
-        cmd: cmd.filter(|s| !s.is_empty()),
+    #[cfg(not(target_os = "macos"))]
+    {
+        if !(mods.control_key() && mods.shift_key()) {
+            return None;
+        }
+        Some(match key {
+            _ if ch("c") => Shortcut::Copy,
+            _ if ch("v") => Shortcut::Paste,
+            _ if ch("t") => Shortcut::NewTab,
+            _ if ch("w") => Shortcut::CloseTab,
+            Key::Named(NamedKey::ArrowUp) => Shortcut::SelectPrev,
+            Key::Named(NamedKey::ArrowDown) => Shortcut::SelectNext,
+            Key::Named(NamedKey::ArrowLeft) => Shortcut::Collapse,
+            Key::Named(NamedKey::ArrowRight) => Shortcut::Expand,
+            _ if ch("s") => Shortcut::Start,
+            _ if ch("x") => Shortcut::Stop,
+            _ => return None,
+        })
     }
 }
 
-/// The shell's *current* working directory (where `cd` at the prompt left
-/// it), via `/proc/<pid>/cwd`. Linux-only, best-effort.
+/// Observe what a PTY's shell is doing (is a command in the foreground, and
+/// what). Best-effort and OS-abstracted (see [`sys`]); any failure degrades to
+/// "nothing observed" (`Obs::default`), which the planner treats as "not
+/// running". `pid == 0` is the headless test harness's sentinel — never a real
+/// shell — so it short-circuits to idle.
+fn observe(shell_pid: u32) -> Obs {
+    if shell_pid == 0 {
+        return Obs::default();
+    }
+    sys::observe(shell_pid)
+}
+
+/// The shell's *current* working directory (where `cd` at the prompt left it).
+/// OS-abstracted (see [`sys`]), best-effort.
 fn proc_cwd(shell_pid: u32) -> Option<PathBuf> {
-    std::fs::read_link(format!("/proc/{shell_pid}/cwd")).ok()
+    if shell_pid == 0 {
+        return None;
+    }
+    sys::proc_cwd(shell_pid)
+}
+
+/// Per-OS process introspection. Each variant exposes the same two pure-ish
+/// functions; the rest of the program never sees the platform. `observe` is
+/// called every frame (per visible session), so it must be cheap — Linux reads
+/// `/proc`, macOS uses the `libproc` syscalls directly (no subprocess).
+mod sys {
+    use super::Obs;
+    use std::path::PathBuf;
+
+    #[cfg(target_os = "linux")]
+    pub fn observe(shell_pid: u32) -> Obs {
+        fn children(pid: u32) -> Vec<u32> {
+            std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+                .ok()
+                .map(|s| s.split_whitespace().filter_map(|x| x.parse().ok()).collect())
+                .unwrap_or_default()
+        }
+        let mut cur = shell_pid;
+        while let Some(&c) = children(cur).first() {
+            cur = c;
+        }
+        if cur == shell_pid {
+            return Obs::default();
+        }
+        let cmd = std::fs::read(format!("/proc/{cur}/cmdline")).ok().map(|b| {
+            b.split(|&c| c == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        Obs {
+            foreground: true,
+            cmd: cmd.filter(|s| !s.is_empty()),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn proc_cwd(shell_pid: u32) -> Option<PathBuf> {
+        std::fs::read_link(format!("/proc/{shell_pid}/cwd")).ok()
+    }
+
+    #[cfg(target_os = "macos")]
+    mod libproc {
+        use std::os::raw::{c_int, c_void};
+
+        // macOS has no `/proc`; these libproc(3) syscalls are the supported way
+        // to walk the process tree and read a process's executable path.
+        unsafe extern "C" {
+            pub fn proc_listchildpids(ppid: c_int, buffer: *mut c_void, buffersize: c_int) -> c_int;
+            pub fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
+        }
+
+        /// Direct children of `pid`. The buffer is zero-initialized and every
+        /// non-zero slot read back, which sidesteps the documented ambiguity in
+        /// `proc_listchildpids`'s return value (bytes vs. count).
+        pub fn children(pid: u32) -> Vec<u32> {
+            let mut buf = vec![0i32; 1024];
+            let n = unsafe {
+                proc_listchildpids(
+                    pid as c_int,
+                    buf.as_mut_ptr() as *mut c_void,
+                    (buf.len() * std::mem::size_of::<i32>()) as c_int,
+                )
+            };
+            if n <= 0 {
+                return Vec::new();
+            }
+            buf.into_iter().filter(|&p| p > 0).map(|p| p as u32).collect()
+        }
+
+        /// Absolute path of `pid`'s executable, if readable.
+        pub fn path(pid: u32) -> Option<String> {
+            const MAX: usize = 4096; // PROC_PIDPATHINFO_MAXSIZE
+            let mut buf = vec![0u8; MAX];
+            let n = unsafe {
+                proc_pidpath(pid as c_int, buf.as_mut_ptr() as *mut c_void, MAX as u32)
+            };
+            if n <= 0 {
+                return None;
+            }
+            buf.truncate(n as usize);
+            String::from_utf8(buf).ok().filter(|s| !s.is_empty())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn observe(shell_pid: u32) -> Obs {
+        // Descend to the deepest foreground descendant of the shell.
+        let mut cur = shell_pid;
+        while let Some(&c) = libproc::children(cur).first() {
+            cur = c;
+        }
+        if cur == shell_pid {
+            return Obs::default();
+        }
+        Obs {
+            foreground: true,
+            cmd: libproc::path(cur),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn proc_cwd(shell_pid: u32) -> Option<PathBuf> {
+        // No `/proc`; `lsof` reports the cwd file descriptor. This only runs on
+        // an explicit "use current working dir" click, so the subprocess cost
+        // is irrelevant.
+        let out = std::process::Command::new("lsof")
+            .args(["-a", "-d", "cwd", "-Fn", "-p", &shell_pid.to_string()])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix('n').map(PathBuf::from))
+    }
+
+    // Any other OS: introspection isn't wired up, so report "idle" / unknown.
+    // The app stays fully usable; only the running-marker and use-cwd dim out.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub fn observe(_shell_pid: u32) -> Obs {
+        Obs::default()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub fn proc_cwd(_shell_pid: u32) -> Option<PathBuf> {
+        None
+    }
 }
 
 // ===========================================================================
@@ -620,55 +813,134 @@ struct Glyph {
     bitmap: Vec<u8>,
 }
 
+/// Which embedded face to draw a cell with, derived from its VT attributes.
+/// The discriminant doubles as the index into `Renderer::styles`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FontStyle {
+    Regular = 0,
+    Bold = 1,
+    Italic = 2,
+    BoldItalic = 3,
+}
+
+/// Map a cell's `Flags` to the face it should be drawn with — "draw bold text
+/// in bold font" and "allow italic text", in iTerm's terms.
+fn font_style(flags: Flags) -> FontStyle {
+    match (flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC)) {
+        (true, true) => FontStyle::BoldItalic,
+        (true, false) => FontStyle::Bold,
+        (false, true) => FontStyle::Italic,
+        (false, false) => FontStyle::Regular,
+    }
+}
+
 struct Renderer {
-    /// `fonts[0]` is the primary monospace face (defines cell metrics); the
-    /// rest are fallbacks consulted, in order, for glyphs it lacks.
-    fonts: Vec<fontdue::Font>,
+    /// The four embedded JetBrains Mono faces, indexed by `FontStyle as usize`.
+    /// `styles[0]` (Regular) defines the cell metrics and the shared baseline.
+    styles: [fontdue::Font; 4],
+    /// OS fallback faces (regular only), consulted in order for glyphs the
+    /// primary family lacks (emoji, CJK, rare symbols).
+    fallbacks: Vec<fontdue::Font>,
     cell_w: usize,
     cell_h: usize,
-    ascent: f32,
-    cache: HashMap<char, Glyph>,
+    /// Rasterized-glyph cache keyed by `(char, style, pixel-size-bits)`. Keying
+    /// on the size lets the same renderer serve both the logical 1× pass and
+    /// the crisp Retina pass (glyphs rasterized at `FONT_PX × scale`).
+    cache: HashMap<(char, u8, u32), Glyph>,
+    /// When `Some`, `draw_text` records (rather than rasterizes) each chrome
+    /// string in *logical* coordinates instead of drawing it. The GUI uses this
+    /// to keep text out of the logical frame so it can be replayed crisply at
+    /// device resolution after the shape layer is upscaled — the same Retina
+    /// fix the terminal grid already gets. `None` = draw immediately (headless).
+    text_log: Option<Vec<TextCmd>>,
+}
+
+/// A deferred chrome-text draw, captured in logical coordinates.
+struct TextCmd {
+    x: usize,
+    y: usize,
+    max_w: usize,
+    text: String,
+    color: u32,
 }
 
 impl Renderer {
     fn new() -> Self {
-        let fonts: Vec<fontdue::Font> = load_fonts()
-            .into_iter()
-            .filter_map(|b| fontdue::Font::from_bytes(b, fontdue::FontSettings::default()).ok())
-            .collect();
-        assert!(!fonts.is_empty(), "no usable font found");
-        let primary = &fonts[0];
+        let load = |b: &[u8]| {
+            fontdue::Font::from_bytes(b.to_vec(), fontdue::FontSettings::default())
+                .expect("embedded font failed to parse")
+        };
+        let styles = [
+            load(UBUNTU_MONO_REGULAR),
+            load(UBUNTU_MONO_BOLD),
+            load(UBUNTU_MONO_ITALIC),
+            load(UBUNTU_MONO_BOLD_ITALIC),
+        ];
+        // Embedded Noto Emoji (monochrome) leads the fallback chain so emoji
+        // render the same on every OS; OS faces follow for anything else the
+        // primary family lacks (CJK, rare symbols).
+        let mut fallbacks: Vec<fontdue::Font> = Vec::new();
+        if let Ok(f) = fontdue::Font::from_bytes(NOTO_EMOJI.to_vec(), fontdue::FontSettings::default())
+        {
+            fallbacks.push(f);
+        }
+        fallbacks.extend(
+            fallback_font_paths()
+                .iter()
+                .filter_map(|p| std::fs::read(p).ok())
+                .filter_map(|b| fontdue::Font::from_bytes(b, fontdue::FontSettings::default()).ok()),
+        );
 
-        let lm = primary
+        let lm = styles[0]
             .horizontal_line_metrics(FONT_PX)
             .expect("font line metrics");
         let cell_h = lm.new_line_size.ceil() as usize;
         // Monospace: every cell is the advance width of a representative glyph.
-        let cell_w = primary.metrics('M', FONT_PX).advance_width.ceil() as usize;
+        let cell_w = styles[0].metrics('M', FONT_PX).advance_width.ceil() as usize;
 
         Self {
-            fonts,
+            styles,
+            fallbacks,
             cell_w: cell_w.max(1),
             cell_h: cell_h.max(1),
-            ascent: lm.ascent,
             cache: HashMap::new(),
+            text_log: None,
         }
     }
 
-    fn glyph(&mut self, c: char) -> &Glyph {
-        let ascent = self.ascent;
-        let fonts = &self.fonts;
-        self.cache.entry(c).or_insert_with(|| {
-            // Pick the first font that actually has this glyph; fall back to
-            // the primary (renders .notdef) if none do.
-            let font = fonts
-                .iter()
-                .find(|f| f.lookup_glyph_index(c) != 0)
-                .unwrap_or(&fonts[0]);
-            let (m, bitmap) = font.rasterize(c, FONT_PX);
-            // fontdue bitmap is top-down; ymin is the offset of the bitmap
-            // bottom below the baseline. Using the primary face's ascent for
-            // every font keeps baselines aligned across faces.
+    /// Rasterize (or fetch from cache) glyph `c` in `style` at `px` pixels.
+    /// Falls back styled-face → regular primary → OS fallbacks for coverage,
+    /// but always positions on the primary's baseline so faces stay aligned.
+    fn glyph(&mut self, c: char, style: FontStyle, px: f32) -> &Glyph {
+        let key = (c, style as u8, px.to_bits());
+        let styles = &self.styles;
+        let fallbacks = &self.fallbacks;
+        self.cache.entry(key).or_insert_with(|| {
+            let styled = &styles[style as usize];
+            let font = if styled.lookup_glyph_index(c) != 0 {
+                styled
+            } else if styles[0].lookup_glyph_index(c) != 0 {
+                &styles[0]
+            } else {
+                fallbacks
+                    .iter()
+                    .find(|f| f.lookup_glyph_index(c) != 0)
+                    .unwrap_or(&styles[0])
+            };
+            // One baseline (the primary's ascent) for every face/fallback.
+            let ascent = styles[0]
+                .horizontal_line_metrics(px)
+                .map(|m| m.ascent)
+                .unwrap_or(px * 0.8);
+            let (m, mut bitmap) = font.rasterize(c, px);
+            // "Thin strokes on Retina Displays": at hi-dpi pixel sizes, lighten
+            // partial coverage so stems read thinner and cleaner, the way macOS
+            // renders text natively (a no-op at the logical 1× size).
+            if px >= FONT_PX * 1.5 {
+                for v in bitmap.iter_mut() {
+                    *v = ((*v as f32 / 255.0).powf(1.45) * 255.0).round() as u8;
+                }
+            }
             let top = (ascent - (m.height as f32 + m.ymin as f32)).round() as i32;
             Glyph {
                 w: m.width,
@@ -681,44 +953,76 @@ impl Renderer {
     }
 }
 
-/// Ask fontconfig for a primary monospace face plus a set of fallback faces
-/// that cover symbols/emoji the monospace font is missing. De-dups by path
-/// and always tries DejaVu as a last resort.
-fn load_fonts() -> Vec<Vec<u8>> {
-    let patterns = [
-        "monospace",
-        "Noto Sans Symbols2",
-        "Symbola",
-        "Noto Sans Symbols",
-        "DejaVu Sans",
-        "Noto Color Emoji",
-    ];
-    let mut paths: Vec<String> = Vec::new();
-    for pat in patterns {
-        if let Ok(out) = std::process::Command::new("fc-match")
-            .args(["-f", "%{file}", pat])
-            .output()
-        {
-            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !p.is_empty() && !paths.contains(&p) {
-                paths.push(p);
+// The primary family is **embedded in the binary** — Ubuntu Mono derivative
+// Powerline (the font from the iTerm setup), all four faces. Shipping the fonts
+// instead of discovering them means the app renders identically on every OS,
+// needs no fontconfig (the previous Linux-only dependency that made it panic on
+// a clean macOS), and keeps screenshots reproducible. Bundling
+// Bold/Italic/BoldItalic is what lets cells render in the correct face per their
+// VT attributes; the "Powerline" patch carries the segment/separator glyphs.
+const UBUNTU_MONO_REGULAR: &[u8] = include_bytes!("../assets/fonts/UbuntuMono-Regular.ttf");
+const UBUNTU_MONO_BOLD: &[u8] = include_bytes!("../assets/fonts/UbuntuMono-Bold.ttf");
+const UBUNTU_MONO_ITALIC: &[u8] = include_bytes!("../assets/fonts/UbuntuMono-Italic.ttf");
+const UBUNTU_MONO_BOLD_ITALIC: &[u8] = include_bytes!("../assets/fonts/UbuntuMono-BoldItalic.ttf");
+
+/// Embedded monochrome emoji face (Noto Emoji, SIL OFL). fontdue rasterizes
+/// outline glyphs only, so colour-bitmap emoji (Apple Color Emoji) can't be
+/// drawn — this gives crisp single-colour emoji that work on every platform.
+const NOTO_EMOJI: &[u8] = include_bytes!("../assets/fonts/NotoEmoji-Regular.ttf");
+
+/// OS-specific fallback font paths for glyph coverage beyond the primary face.
+/// Pure list of candidate paths; non-existent ones are skipped by `load_fonts`.
+fn fallback_font_paths() -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Symbol/CJK/emoji faces shipped with every macOS. Apple Color Emoji
+        // is a bitmap (sbix) face; fontdue reads its outline layer, which is
+        // enough to avoid blank cells for the common pictographs.
+        [
+            "/System/Library/Fonts/Apple Symbols.ttf",
+            "/System/Library/Fonts/Symbol.ttf",
+            "/System/Library/Fonts/Apple Color Emoji.ttc",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Elsewhere (Linux/BSD), ask fontconfig for symbol/emoji coverage if
+        // it's present; absence is fine, the embedded primary still renders.
+        let patterns = [
+            "Noto Sans Symbols2",
+            "Symbola",
+            "Noto Sans Symbols",
+            "DejaVu Sans",
+            "Noto Color Emoji",
+        ];
+        let mut paths: Vec<String> = Vec::new();
+        for pat in patterns {
+            if let Ok(out) = std::process::Command::new("fc-match")
+                .args(["-f", "%{file}", pat])
+                .output()
+            {
+                let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !p.is_empty() && !paths.contains(&p) {
+                    paths.push(p);
+                }
             }
         }
+        paths
     }
-    let mut fonts: Vec<Vec<u8>> = paths.iter().filter_map(|p| std::fs::read(p).ok()).collect();
-    if fonts.is_empty() {
-        fonts.push(
-            std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
-                .expect("no monospace font found (install fontconfig or DejaVu Sans Mono)"),
-        );
-    }
-    fonts
 }
 
-// Light mode by default.
-const FG: u32 = 0x1a_1a_1a;
-const BG: u32 = 0xff_ff_ff;
-const SEL: u32 = 0xbf_d9_f2;
+// Dark theme: white text over the teal/green backdrop image, black chrome.
+const FG: u32 = 0xea_ea_ea; // terminal default text (white)
+// `BG` doubles as the "default background" sentinel — cells with this bg are
+// left unfilled so the backdrop image shows through. Its value only shows if a
+// cell is *explicitly* filled with the default bg, so it's a dark teal that
+// blends with the image.
+const BG: u32 = 0x0b_1d_1d;
+const SEL: u32 = 0x2f_5d_6e; // selection fill (white text stays readable)
 
 // --- Win2k chrome ----------------------------------------------------------
 // Windows 2000 design *principles* (not its colours): explicit borders and
@@ -735,16 +1039,18 @@ const WBTN_W: usize = 30; // min/max/close button width
 const INFO_H: usize = 24; // sidebar "info" toggle band, below WORKSPACE
 const EDGE: f64 = 5.0; // borderless-window resize-grip thickness
 
-const STRIP_BG: u32 = 0xc0_c0_c0; // chrome background
-const PANEL_HI: u32 = 0xff_ff_ff; // top of a raised gradient
-const PANEL_LO: u32 = 0xe4_e4_e4; // bottom of a raised gradient
-const HEAD_HI: u32 = 0xd9_d9_d9; // header gradient top
-const HEAD_LO: u32 = 0xbe_be_be; // header gradient bottom
-const BEVEL_LT: u32 = 0xff_ff_ff; // raised highlight (top/left)
-const BEVEL_DK: u32 = 0x80_80_80; // raised shadow (bottom/right)
-const INK: u32 = 0x1a_1a_1a; // primary chrome text
-const INK_DIM: u32 = 0x5a_5a_5a; // secondary chrome text
-const RUN_INK: u32 = 0x10_7c_10; // "running" marker (green square)
+// Black chrome with white text. The Win2k bevel structure is kept but recolored
+// to dark grays so panels read as raised/inset without any light surfaces.
+const STRIP_BG: u32 = 0x0a_0a_0a; // chrome background (near-black)
+const PANEL_HI: u32 = 0x33_33_33; // top of a raised gradient (selected row/button)
+const PANEL_LO: u32 = 0x1f_1f_1f; // bottom of a raised gradient
+const HEAD_HI: u32 = 0x16_16_16; // header gradient top
+const HEAD_LO: u32 = 0x08_08_08; // header gradient bottom
+const BEVEL_LT: u32 = 0x3a_3a_3a; // raised highlight (top/left)
+const BEVEL_DK: u32 = 0x00_00_00; // raised shadow (bottom/right)
+const INK: u32 = 0xf0_f0_f0; // primary chrome text (white)
+const INK_DIM: u32 = 0xa0_a0_a0; // secondary chrome text (gray)
+const RUN_INK: u32 = 0x3f_d0_4f; // "running" marker (green square)
 
 /// Map a terminal color to RGB. A compact, good-enough palette.
 fn rgb(color: Color, default: u32) -> u32 {
@@ -759,24 +1065,26 @@ fn pack(r: u8, g: u8, b: u8) -> u32 {
     (r as u32) << 16 | (g as u32) << 8 | b as u32
 }
 
+// ANSI palette tuned for the **dark** backdrop: bright, saturated hues that pop
+// against the teal/green image, with white text as the default foreground.
 fn named_rgb(n: NamedColor) -> Option<u32> {
     Some(match n {
-        NamedColor::Black => 0x1d1f21,
-        NamedColor::Red => 0xcc6666,
-        NamedColor::Green => 0xb5bd68,
-        NamedColor::Yellow => 0xf0c674,
-        NamedColor::Blue => 0x81a2be,
-        NamedColor::Magenta => 0xb294bb,
-        NamedColor::Cyan => 0x8abeb7,
-        NamedColor::White => 0xc5c8c6,
-        NamedColor::BrightBlack => 0x666666,
-        NamedColor::BrightRed => 0xd54e53,
-        NamedColor::BrightGreen => 0xb9ca4a,
-        NamedColor::BrightYellow => 0xe7c547,
-        NamedColor::BrightBlue => 0x7aa6da,
-        NamedColor::BrightMagenta => 0xc397d8,
-        NamedColor::BrightCyan => 0x70c0b1,
-        NamedColor::BrightWhite => 0xeaeaea,
+        NamedColor::Black => 0x2b2b2b,
+        NamedColor::Red => 0xff6d67,
+        NamedColor::Green => 0x8ae234,
+        NamedColor::Yellow => 0xfce94f,
+        NamedColor::Blue => 0x78b6ff,
+        NamedColor::Magenta => 0xe48bff,
+        NamedColor::Cyan => 0x54e1d6,
+        NamedColor::White => 0xeaeaea,
+        NamedColor::BrightBlack => 0x6a6a6a,
+        NamedColor::BrightRed => 0xff8b86,
+        NamedColor::BrightGreen => 0xadf85f,
+        NamedColor::BrightYellow => 0xfff27a,
+        NamedColor::BrightBlue => 0x9ccbff,
+        NamedColor::BrightMagenta => 0xf0a8ff,
+        NamedColor::BrightCyan => 0x7defe4,
+        NamedColor::BrightWhite => 0xffffff,
         NamedColor::Foreground | NamedColor::BrightForeground => FG,
         NamedColor::Background => BG,
         NamedColor::Cursor => FG,
@@ -821,6 +1129,89 @@ const ANSI16: [NamedColor; 16] = [
     NamedColor::BrightCyan,
     NamedColor::BrightWhite,
 ];
+
+// --- backdrop image --------------------------------------------------------
+// The terminal area is drawn over the user's profile background image (the same
+// teal/green gradient as their iTerm). It's embedded so it travels with the
+// binary, decoded once, and pre-darkened so white text and the bright ANSI
+// palette stay readable over it (this is iTerm's "background blend").
+
+/// Embedded background image bytes (PNG).
+const BACKDROP_PNG: &[u8] = include_bytes!("../assets/profile-default-bg.png");
+
+/// How far to blend the image toward black, 0..=255 (readability dimming).
+const BACKDROP_DIM: u32 = 96;
+
+/// A decoded, pre-darkened RGB image: `px[y * w + x]` packed `0x00RRGGBB`.
+struct Backdrop {
+    w: usize,
+    h: usize,
+    px: Vec<u32>,
+}
+
+/// Decode the embedded image once (lazily) and cache it for the process. Decode
+/// failure degrades to a 1×1 dark tile, so the app still runs (just a flat dark
+/// terminal background) rather than panicking.
+fn backdrop() -> &'static Backdrop {
+    static BACKDROP: std::sync::OnceLock<Backdrop> = std::sync::OnceLock::new();
+    BACKDROP.get_or_init(|| {
+        match image::load_from_memory(BACKDROP_PNG) {
+            Ok(img) => {
+                let rgb = img.to_rgb8();
+                let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+                let px = rgb
+                    .pixels()
+                    .map(|p| darken(pack(p[0], p[1], p[2]), BACKDROP_DIM))
+                    .collect();
+                Backdrop { w, h, px }
+            }
+            Err(_) => Backdrop {
+                w: 1,
+                h: 1,
+                px: vec![darken(BG, BACKDROP_DIM)],
+            },
+        }
+    })
+}
+
+/// Fast integer blend of `color` toward black by `k`/255 (no gamma — this is a
+/// bulk fill, not glyph anti-aliasing). `k = 0` keeps the color, `255` = black.
+fn darken(color: u32, k: u32) -> u32 {
+    let f = 255 - k;
+    let r = (((color >> 16) & 0xff) * f) / 255;
+    let g = (((color >> 8) & 0xff) * f) / 255;
+    let b = ((color & 0xff) * f) / 255;
+    r << 16 | g << 8 | b
+}
+
+/// Paint the backdrop image, stretched to cover the rect `(x, y, w, h)`, into
+/// `buf`. Used wherever the terminal background is laid down (the logical
+/// compose and the crisp Retina overdraw) so the image shows under every cell
+/// that doesn't set its own background. Stretching a smooth gradient is
+/// visually lossless, so no aspect-correct cropping is needed.
+fn fill_backdrop(buf: &mut [u32], bw: usize, bh: usize, x: usize, y: usize, w: usize, h: usize) {
+    let img = backdrop();
+    if w == 0 || h == 0 || img.w == 0 || img.h == 0 {
+        return;
+    }
+    for ry in 0..h {
+        let py = y + ry;
+        if py >= bh {
+            break;
+        }
+        let sy = (ry * img.h / h).min(img.h - 1);
+        let srow = sy * img.w;
+        let drow = py * bw;
+        for rx in 0..w {
+            let px = x + rx;
+            if px >= bw {
+                break;
+            }
+            let sx = (rx * img.w / w).min(img.w - 1);
+            buf[drow + px] = img.px[srow + sx];
+        }
+    }
+}
 
 /// One terminal session: its own PTY thread + VT state machine + grid size.
 /// Reused as-is; `spawn_session` now also returns the shell pid for `/proc`.
@@ -1012,61 +1403,37 @@ impl State {
         let tr = term_right(pw, self.inspector);
 
         // --- terminal area --------------------------------------------------
+        // Lay the backdrop image behind the grid; cells without their own
+        // background let it show through (the dark theme).
+        fill_backdrop(
+            &mut buf,
+            pw,
+            ph,
+            SIDEBAR_W,
+            HEADER_H,
+            tr.saturating_sub(SIDEBAR_W),
+            ph.saturating_sub(HEADER_H),
+        );
         if let Some(node) = shown {
+            // Render the grid at logical (1×) size into `buf`. The GUI redraw
+            // re-renders it crisply at device resolution on Retina; the test
+            // harness reads this buffer directly.
+            let lines = self.sessions[&node].tab.size.lines as i32;
             let term = self.sessions[&node].tab.term.lock();
-            // `display_iter` numbers scrollback with negative grid lines; the
-            // visible viewport is shifted by the scroll offset, so a grid
-            // line maps to on-screen row `line + display_offset`.
-            let offset = term.grid().display_offset() as i32;
-            let rows = self.sessions[&node].tab.size.lines as i32;
-            let content = term.renderable_content();
-            let cursor = content.cursor.point;
-            let selection = content.selection;
-            for cell in content.display_iter {
-                let row = cell.point.line.0 + offset;
-                if row < 0 || row >= rows {
-                    continue;
-                }
-                let col = cell.point.column.0;
-                let x0 = SIDEBAR_W + col * cw;
-                let y0 = HEADER_H + row as usize * ch;
-                let is_cursor =
-                    cell.point.line == cursor.line && cell.point.column == cursor.column;
-                let selected = selection.is_some_and(|s| s.contains(cell.point));
-                let mut fg = rgb(cell.fg, FG);
-                let mut bg = rgb(cell.bg, BG);
-                if is_cursor {
-                    std::mem::swap(&mut fg, &mut bg);
-                } else if selected {
-                    bg = SEL;
-                }
-                if bg != BG {
-                    fill_rect(&mut buf, pw, ph, x0, y0, cw, ch, bg);
-                }
-                let c = cell.c;
-                if c == ' ' || c == '\0' {
-                    continue;
-                }
-                let g = self.renderer.glyph(c);
-                for gy in 0..g.h {
-                    let py = y0 as i32 + g.top + gy as i32;
-                    if py < 0 || py as usize >= ph {
-                        continue;
-                    }
-                    for gx in 0..g.w {
-                        let px = x0 as i32 + g.left + gx as i32;
-                        if px < SIDEBAR_W as i32 || px as usize >= tr {
-                            continue;
-                        }
-                        let a = g.bitmap[gy * g.w + gx] as u32;
-                        if a == 0 {
-                            continue;
-                        }
-                        let idx = py as usize * pw + px as usize;
-                        buf[idx] = blend(fg, buf[idx], a);
-                    }
-                }
-            }
+            draw_terminal_cells(
+                &mut buf,
+                pw,
+                ph,
+                &mut self.renderer,
+                &term,
+                lines,
+                SIDEBAR_W,
+                HEADER_H,
+                tr,
+                cw,
+                ch,
+                FONT_PX,
+            );
             drop(term);
         } else {
             draw_text(
@@ -1077,48 +1444,23 @@ impl State {
                 SIDEBAR_W + 10,
                 HEADER_H + 10,
                 tr.saturating_sub(SIDEBAR_W + 20),
-                "No session here. Right-click a node \u{2192} Start, or Ctrl+Shift+T for a shell.",
+                NO_SESSION_HINT,
                 INK_DIM,
             );
         }
 
         // --- header bar over the terminal ----------------------------------
-        let running = shown.is_some_and(|n| {
-            self.sessions
-                .get(&n)
-                .map(|s| observe(s.shell_pid).foreground)
-                .unwrap_or(false)
-        });
-        let title = match shown {
-            Some(n) => format!(
-                "{}      [{}]",
-                self.tree.path(n),
-                if running { "running" } else { "idle" }
-            ),
-            None => "termem".to_string(),
-        };
+        // (No title text — the path/status label is intentionally hidden.)
         vgradient(&mut buf, pw, ph, SIDEBAR_W, 0, pw - SIDEBAR_W, HEADER_H, HEAD_HI, HEAD_LO);
         fill_rect(&mut buf, pw, ph, SIDEBAR_W, HEADER_H - 1, pw - SIDEBAR_W, 1, BEVEL_DK);
         fill_rect(&mut buf, pw, ph, SIDEBAR_W, 0, pw - SIDEBAR_W, 1, BEVEL_LT);
-        let ty = HEADER_H.saturating_sub(self.renderer.cell_h) / 2;
         let maxed = self.window.as_ref().is_some_and(|w| w.is_maximized());
         let [bmin, bmax, bclose] = win_btns(pw);
-        draw_text(
-            &mut buf,
-            pw,
-            ph,
-            &mut self.renderer,
-            SIDEBAR_W + 8,
-            ty,
-            bmin.0.saturating_sub(SIDEBAR_W + 16),
-            &title,
-            INK,
-        );
 
         // Window controls, right-aligned in the header row.
         for (rect, label) in [
             (bmin, "\u{2013}"),                                // –  minimize
-            (bmax, if maxed { "\u{2750}" } else { "\u{25a1}" }), // ▢ / ❐
+            (bmax, if maxed { "x" } else { "\u{25a1}" }), // □ / x (restore — placeholder)
             (bclose, "\u{2715}"),                              // ✕  close
         ] {
             draw_button(&mut buf, pw, ph, &mut self.renderer, rect, label, false, true);
@@ -1160,6 +1502,57 @@ impl State {
         }
 
         self.fb = buf;
+    }
+
+    /// Re-render just the terminal grid at full device resolution, directly onto
+    /// the physical surface `buf`, *after* the logical frame has been upscaled
+    /// into it. This is the Retina text fix: the chrome (pixel-art bevels) is
+    /// fine nearest-neighbour-upscaled, but text doubled that way is chunky, so
+    /// here the glyphs are rasterized at `FONT_PX × scale` and drawn crisply
+    /// over the upscaled copy. A no-op at 1× (the logical frame is already
+    /// native) and headless (no surface, so this is never called).
+    fn overdraw_terminal_physical(&mut self, buf: &mut [u32], pw: usize, ph: usize) {
+        let (lw, lh) = self.logical_size();
+        if (lw, lh) == (pw, ph) {
+            return; // 1×: `paint` already produced native-resolution text
+        }
+        let Some(node) = self.shown() else { return };
+        let sx = pw as f64 / lw as f64;
+        let sy = ph as f64 / lh as f64;
+        let origin_x = (SIDEBAR_W as f64 * sx).round() as usize;
+        let origin_y = (HEADER_H as f64 * sy).round() as usize;
+        let clip_right = (term_right(lw, self.inspector) as f64 * sx).round() as usize;
+        let cell_w = ((self.renderer.cell_w as f64 * sx).round() as usize).max(1);
+        let cell_h = ((self.renderer.cell_h as f64 * sy).round() as usize).max(1);
+        let font_px = FONT_PX * sy as f32;
+        let lines = self.sessions[&node].tab.size.lines as i32;
+        // Re-lay the backdrop image in the terminal viewport so the crisp pass
+        // leaves no antialiasing ghosts behind and the image stays under the
+        // text; per-cell backgrounds are repainted by `draw_terminal_cells`.
+        fill_backdrop(
+            buf,
+            pw,
+            ph,
+            origin_x,
+            origin_y,
+            clip_right.saturating_sub(origin_x),
+            ph.saturating_sub(origin_y),
+        );
+        let term = self.sessions[&node].tab.term.lock();
+        draw_terminal_cells(
+            buf,
+            pw,
+            ph,
+            &mut self.renderer,
+            &term,
+            lines,
+            origin_x,
+            origin_y,
+            clip_right,
+            cell_w,
+            cell_h,
+            font_px,
+        );
     }
 
     /// Which leaf's terminal to show: the selection if it is a leaf with a
@@ -1421,6 +1814,39 @@ impl App {
         }
     }
 
+    /// Move the sidebar selection by `delta` visible rows — the keyboard
+    /// equivalent of clicking the row above/below (⌘↑/⌘↓, Ctrl+Shift+↑/↓
+    /// elsewhere). It folds over the same `rows()` the sidebar draws, so up/down
+    /// always tracks the picture on screen, and wraps around the ends so the
+    /// tabs cycle. A selection that isn't currently visible (its group is
+    /// collapsed) snaps back to the first row.
+    fn select_relative(&mut self, delta: i32) {
+        let Some(st) = self.state.as_mut() else { return };
+        let rows = st.tree.rows();
+        if rows.is_empty() {
+            return;
+        }
+        let next = match rows.iter().position(|r| r.id == st.selected) {
+            Some(i) => (i as i32 + delta).rem_euclid(rows.len() as i32) as usize,
+            None => 0,
+        };
+        st.selected = rows[next].id;
+        st.focus = None;
+        st.request_redraw();
+    }
+
+    /// Fold (⌘←/Ctrl+Shift+←) or unfold (⌘→/Ctrl+Shift+→) the selected group.
+    /// A no-op when a leaf is selected — leaves have nothing to expand — so the
+    /// keystroke is simply swallowed rather than leaking to the PTY.
+    fn set_group_expanded(&mut self, open: bool) {
+        let Some(st) = self.state.as_mut() else { return };
+        if !st.tree.is_group(st.selected) {
+            return;
+        }
+        st.tree.nodes[st.selected].expanded = open;
+        st.request_redraw();
+    }
+
     /// Reflow every session's grid to the current terminal area. The window
     /// is shared, so a resize *or* an inspector toggle reflows them all (not
     /// just the visible one) to keep background sessions sane.
@@ -1560,16 +1986,27 @@ impl App {
         true
     }
 
-    /// Compose the frame (into the logical framebuffer) and blit it onto the
-    /// physical window surface, upscaling by the device scale. The harness
-    /// skips this and calls `State::paint` + reads `fb` directly.
+    /// Compose the frame and blit it onto the physical window surface. On a
+    /// Retina display the chrome's *shapes* (pixel-art bevels/gradients) are
+    /// nearest-neighbour upscaled — that keeps them crisp — but all *text*
+    /// (chrome and terminal) is rendered fresh at true device resolution on
+    /// top, so nothing looks doubled or soft. The harness skips this and reads
+    /// `State::fb` directly. Non-HiDPI is a straight copy.
     fn redraw(&mut self) {
-        if let Some(st) = self.state.as_mut() {
+        let scaled = if let Some(st) = self.state.as_mut() {
             st.sync_metrics();
+            let (lw, lh) = st.logical_size();
+            let scaled = (lw, lh) != st.phys;
+            // Capture chrome text instead of drawing it into the logical frame,
+            // so it doesn't get upscaled-and-chunky — we replay it crisply below.
+            st.renderer.text_log = if scaled { Some(Vec::new()) } else { None };
             st.paint();
-        }
+            scaled
+        } else {
+            return;
+        };
         let App { state, surface, .. } = self;
-        let (Some(st), Some(surface)) = (state.as_ref(), surface.as_mut()) else {
+        let (Some(st), Some(surface)) = (state.as_mut(), surface.as_mut()) else {
             return;
         };
         let (pw, ph) = st.phys;
@@ -1579,20 +2016,28 @@ impl App {
         let (lw, lh) = st.logical_size();
         surface.resize(w, h).unwrap();
         let mut buf = surface.buffer_mut().unwrap();
-        if (lw, lh) == (pw, ph) {
+        if !scaled {
             // Non-HiDPI: the logical frame already is the physical frame.
             buf.copy_from_slice(&st.fb);
-        } else {
-            // Nearest-neighbour upscale so the Win2k chrome stays crisp and
-            // pixel-identical across display densities (the macOS fix).
-            for py in 0..ph {
-                let ly = (py * lh / ph).min(lh - 1);
-                let (srow, drow) = (ly * lw, py * pw);
-                for px in 0..pw {
-                    let lx = (px * lw / pw).min(lw - 1);
-                    buf[drow + px] = st.fb[srow + lx];
-                }
+            buf.present().unwrap();
+            return;
+        }
+        // Nearest-neighbour upscale of the shape layer (text was captured, not
+        // drawn, so this doesn't blur any glyphs).
+        for py in 0..ph {
+            let ly = (py * lh / ph).min(lh - 1);
+            let (srow, drow) = (ly * lw, py * pw);
+            for px in 0..pw {
+                let lx = (px * lw / pw).min(lw - 1);
+                buf[drow + px] = st.fb[srow + lx];
             }
+        }
+        // Now render text at true device resolution over the upscaled shapes:
+        // the terminal grid first, then the captured chrome strings.
+        st.overdraw_terminal_physical(&mut buf[..], pw, ph);
+        let (sx, sy) = (pw as f64 / lw as f64, ph as f64 / lh as f64);
+        if let Some(cmds) = st.renderer.text_log.take() {
+            render_text_cmds(&mut buf[..], pw, ph, &mut st.renderer, cmds, sx, sy);
         }
         buf.present().unwrap();
     }
@@ -1675,7 +2120,11 @@ fn stroke_rect(buf: &mut [u32], pw: usize, ph: usize, x: usize, y: usize, w: usi
     fill_rect(buf, pw, ph, x + w - 1, y, 1, h, color);
 }
 
-/// Draw a left-aligned monospace string, clipped to `max_w` pixels.
+/// Draw a left-aligned monospace string, clipped to `max_w` pixels. Chrome
+/// text is always the Regular face at the logical size. When the renderer's
+/// `text_log` is armed (the GUI's Retina path), the string is *recorded* in
+/// logical coordinates and replayed crisply later by [`render_text_cmds`]
+/// instead of being rasterized here.
 fn draw_text(
     buf: &mut [u32],
     pw: usize,
@@ -1687,6 +2136,16 @@ fn draw_text(
     text: &str,
     color: u32,
 ) {
+    if let Some(log) = &mut r.text_log {
+        log.push(TextCmd {
+            x,
+            y,
+            max_w,
+            text: text.to_string(),
+            color,
+        });
+        return;
+    }
     let cw = r.cell_w;
     let mut pen = x;
     for c in text.chars() {
@@ -1694,19 +2153,18 @@ fn draw_text(
             break;
         }
         if c != ' ' {
-            let g = r.glyph(c);
-            let (gw, gh, gl, gt) = (g.w, g.h, g.left, g.top);
-            for gy in 0..gh {
-                let py = y as i32 + gt + gy as i32;
+            let g = r.glyph(c, FontStyle::Regular, FONT_PX);
+            for gy in 0..g.h {
+                let py = y as i32 + g.top + gy as i32;
                 if py < 0 || py as usize >= ph {
                     continue;
                 }
-                for gx in 0..gw {
-                    let px = pen as i32 + gl + gx as i32;
+                for gx in 0..g.w {
+                    let px = pen as i32 + g.left + gx as i32;
                     if px < 0 || px as usize >= pw {
                         continue;
                     }
-                    let a = r.cache[&c].bitmap[gy * gw + gx] as u32;
+                    let a = g.bitmap[gy * g.w + gx] as u32;
                     if a == 0 {
                         continue;
                     }
@@ -1716,6 +2174,165 @@ fn draw_text(
             }
         }
         pen += cw;
+    }
+}
+
+/// Replay captured chrome-text commands onto `buf` at device resolution: each
+/// logical command is re-laid at `(sx, sy)` with glyphs rasterized at
+/// `FONT_PX × sy`, so chrome text comes out as crisp as the terminal grid on a
+/// Retina display (rather than being nearest-neighbour-doubled and chunky).
+fn render_text_cmds(buf: &mut [u32], bw: usize, bh: usize, r: &mut Renderer, cmds: Vec<TextCmd>, sx: f64, sy: f64) {
+    let font_px = FONT_PX * sy as f32;
+    let cell_w = ((r.cell_w as f64 * sx).round() as usize).max(1);
+    for cmd in cmds {
+        let x0 = (cmd.x as f64 * sx).round() as usize;
+        let y0 = (cmd.y as f64 * sy).round() as usize;
+        let max_w = (cmd.max_w as f64 * sx).round() as usize;
+        let mut pen = x0;
+        for c in cmd.text.chars() {
+            if pen + cell_w > x0 + max_w {
+                break;
+            }
+            if c != ' ' {
+                let g = r.glyph(c, FontStyle::Regular, font_px);
+                for gy in 0..g.h {
+                    let py = y0 as i32 + g.top + gy as i32;
+                    if py < 0 || py as usize >= bh {
+                        continue;
+                    }
+                    for gx in 0..g.w {
+                        let px = pen as i32 + g.left + gx as i32;
+                        if px < 0 || px as usize >= bw {
+                            continue;
+                        }
+                        let a = g.bitmap[gy * g.w + gx] as u32;
+                        if a == 0 {
+                            continue;
+                        }
+                        let idx = py as usize * bw + px as usize;
+                        buf[idx] = blend(cmd.color, buf[idx], a);
+                    }
+                }
+            }
+            pen += cell_w;
+        }
+    }
+}
+
+/// Render the visible grid of one terminal into `buf` at an arbitrary scale.
+/// All geometry is in *target* pixels, so the same routine serves the logical
+/// 1× compose (`paint`) and the crisp device-resolution Retina pass (`redraw`):
+/// pass cell/origin sizes already multiplied by the device scale and `font_px =
+/// FONT_PX × scale`. Honours per-cell colour, the cursor block, selection,
+/// bold/italic faces, dim, underline/strikeout and Unicode-9 wide cells.
+#[allow(clippy::too_many_arguments)]
+fn draw_terminal_cells(
+    buf: &mut [u32],
+    bw: usize,
+    bh: usize,
+    r: &mut Renderer,
+    term: &Term<Listener>,
+    lines: i32,
+    origin_x: usize,
+    origin_y: usize,
+    clip_right: usize,
+    cell_w: usize,
+    cell_h: usize,
+    font_px: f32,
+) {
+    // `display_iter` numbers scrollback with negative grid lines; the visible
+    // viewport is shifted by the scroll offset, so a grid line maps to on-screen
+    // row `line + display_offset`.
+    let offset = term.grid().display_offset() as i32;
+    let content = term.renderable_content();
+    let cursor = content.cursor.point;
+    let selection = content.selection;
+    for cell in content.display_iter {
+        let row = cell.point.line.0 + offset;
+        if row < 0 || row >= lines {
+            continue;
+        }
+        // The trailing half of a wide (double-width) char carries no glyph of
+        // its own — the lead cell's glyph spans into it.
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        let col = cell.point.column.0;
+        let x0 = origin_x + col * cell_w;
+        let y0 = origin_y + row as usize * cell_h;
+        let wide = cell.flags.contains(Flags::WIDE_CHAR);
+        let span = if wide { cell_w * 2 } else { cell_w };
+
+        let is_cursor = cell.point.line == cursor.line && cell.point.column == cursor.column;
+        let selected = selection.is_some_and(|s| s.contains(cell.point));
+        let mut fg = rgb(cell.fg, FG);
+        let mut bg = rgb(cell.bg, BG);
+        if cell.flags.contains(Flags::DIM) {
+            fg = blend(fg, bg, 150); // dim = pull the ink toward its background
+        }
+        if is_cursor {
+            std::mem::swap(&mut fg, &mut bg);
+        } else if selected {
+            bg = SEL;
+        }
+        if bg != BG {
+            fill_rect(buf, bw, bh, x0, y0, span.min(clip_right.saturating_sub(x0)), cell_h, bg);
+        }
+
+        let c = cell.c;
+        let drawable = c != ' ' && c != '\0' && !cell.flags.contains(Flags::HIDDEN);
+        if drawable {
+            let g = r.glyph(c, font_style(cell.flags), font_px);
+            for gy in 0..g.h {
+                let py = y0 as i32 + g.top + gy as i32;
+                if py < 0 || py as usize >= bh {
+                    continue;
+                }
+                for gx in 0..g.w {
+                    let px = x0 as i32 + g.left + gx as i32;
+                    if px < origin_x as i32 || px as usize >= clip_right {
+                        continue;
+                    }
+                    let a = g.bitmap[gy * g.w + gx] as u32;
+                    if a == 0 {
+                        continue;
+                    }
+                    let idx = py as usize * bw + px as usize;
+                    buf[idx] = blend(fg, buf[idx], a);
+                }
+            }
+        }
+
+        // Decorations sit on the baseline-ish; thickness scales with the cell.
+        let thick = (cell_h / 14).max(1);
+        if cell.flags.contains(Flags::UNDERLINE) {
+            let uy = y0 + cell_h.saturating_sub(thick + 1);
+            hline(buf, bw, bh, x0, uy, span, clip_right, thick, fg);
+        }
+        if cell.flags.contains(Flags::STRIKEOUT) {
+            let sy = y0 + cell_h / 2;
+            hline(buf, bw, bh, x0, sy, span, clip_right, thick, fg);
+        }
+    }
+}
+
+/// A clipped horizontal rule `thick` px tall (terminal underline/strikeout).
+fn hline(
+    buf: &mut [u32],
+    bw: usize,
+    bh: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    clip_right: usize,
+    thick: usize,
+    color: u32,
+) {
+    let right = (x + w).min(clip_right).min(bw);
+    for yy in y..(y + thick).min(bh) {
+        for xx in x..right {
+            buf[yy * bw + xx] = color;
+        }
     }
 }
 
@@ -1737,8 +2354,8 @@ fn draw_sidebar(
     vgradient(buf, pw, ph, 0, 0, SIDEBAR_W, HEADER_H, HEAD_HI, HEAD_LO);
     fill_rect(buf, pw, ph, 0, 0, SIDEBAR_W, 1, BEVEL_LT);
     fill_rect(buf, pw, ph, 0, HEADER_H - 1, SIDEBAR_W, 1, BEVEL_DK);
+    // (No "WORKSPACE" header label — intentionally hidden.)
     let ty = HEADER_H.saturating_sub(r.cell_h) / 2;
-    draw_text(buf, pw, ph, r, 8, ty, SIDEBAR_W - 16, "WORKSPACE", INK);
     // Hard divider between the pane and the terminal.
     fill_rect(buf, pw, ph, SIDEBAR_W - 1, 0, 1, ph, BEVEL_DK);
     // Latched info icon directly below the WORKSPACE head.
@@ -2161,6 +2778,8 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // No OS title bar: we draw our own in the header row to reclaim that
         // strip of screen.
+        // `mut` is only used by the Linux WM-class block below.
+        #[allow(unused_mut)]
         let mut attrs = Window::default_attributes()
             .with_title("termem")
             .with_decorations(false);
@@ -2406,8 +3025,25 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
-                        // 6. The header row (anywhere else) drags the window.
+                        // 6. The header row (anywhere else): double-click
+                        // toggles maximize/restore (like a native title bar);
+                        // a single click drags the window.
                         if my < HEADER_H as f64 {
+                            let now = std::time::Instant::now();
+                            let st = self.state.as_ref().unwrap();
+                            let double = st.last_click.is_some_and(|(t, p)| {
+                                now.duration_since(t).as_millis() < 400
+                                    && (p.0 - mx).abs() < 4.0
+                                    && (p.1 - my).abs() < 4.0
+                            });
+                            if double {
+                                if let Some(w) = st.window.clone() {
+                                    w.set_maximized(!w.is_maximized());
+                                }
+                                self.state.as_mut().unwrap().last_click = None;
+                                return;
+                            }
+                            self.state.as_mut().unwrap().last_click = Some((now, (mx, my)));
                             if let Some(w) = &self.state.as_ref().unwrap().window {
                                 let _ = w.drag_window();
                             }
@@ -2519,38 +3155,35 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 let kmods = self.state.as_ref().map(|s| s.mods).unwrap_or_default();
-                if kmods.control_key() && kmods.shift_key() {
-                    match &event.logical_key {
-                        Key::Character(c) if c.eq_ignore_ascii_case("c") => {
-                            self.copy_to_clipboard();
-                            return;
-                        }
-                        Key::Character(c) if c.eq_ignore_ascii_case("v") => {
-                            self.paste();
-                            return;
-                        }
-                        Key::Character(c) if c.eq_ignore_ascii_case("t") => {
-                            self.new_scratch();
-                            return;
-                        }
-                        Key::Character(c) if c.eq_ignore_ascii_case("w") => {
-                            self.close_selected();
-                            return;
-                        }
-                        Key::Character(c) if c.eq_ignore_ascii_case("s") => {
-                            if let Some(n) = self.state.as_ref().map(|s| s.selected) {
+                if let Some(sc) = match_shortcut(kmods, &event.logical_key) {
+                    let sel = self.state.as_ref().map(|s| s.selected);
+                    match sc {
+                        Shortcut::Copy => self.copy_to_clipboard(),
+                        Shortcut::Paste => self.paste(),
+                        Shortcut::NewTab => self.new_scratch(),
+                        Shortcut::CloseTab => self.close_selected(),
+                        Shortcut::SelectPrev => self.select_relative(-1),
+                        Shortcut::SelectNext => self.select_relative(1),
+                        Shortcut::Collapse => self.set_group_expanded(false),
+                        Shortcut::Expand => self.set_group_expanded(true),
+                        Shortcut::Start => {
+                            if let Some(n) = sel {
                                 self.start(n);
                             }
-                            return;
                         }
-                        Key::Character(c) if c.eq_ignore_ascii_case("x") => {
-                            if let Some(n) = self.state.as_ref().map(|s| s.selected) {
+                        Shortcut::Stop => {
+                            if let Some(n) = sel {
                                 self.stop(n);
                             }
-                            return;
                         }
-                        _ => {}
                     }
+                    return;
+                }
+                // On macOS, swallow any other ⌘-combo so it can't leak into the
+                // PTY as stray text. (Ctrl-combos fall through to the shell.)
+                #[cfg(target_os = "macos")]
+                if kmods.super_key() {
+                    return;
                 }
                 let mods = kmods;
                 let (ctrl, alt, shift) = (mods.control_key(), mods.alt_key(), mods.shift_key());
@@ -2941,5 +3574,43 @@ mod tests {
         let (wd, cmd) = t.leaf_spec(leaves[0]).unwrap();
         assert_eq!(wd, std::env::current_dir().unwrap());
         assert_eq!(cmd, "", "just a shell, no default command");
+    }
+
+    #[test]
+    fn embedded_font_loads_and_rasterizes() {
+        // The primary face is baked into the binary, so this must succeed on a
+        // bare machine with no fontconfig and no system fonts — the macOS fix.
+        let mut r = Renderer::new();
+        assert!(r.cell_w >= 1 && r.cell_h >= 1, "cell metrics must be positive");
+        let g = r.glyph('M', FontStyle::Regular, FONT_PX);
+        assert!(g.w > 0 && g.h > 0, "a basic glyph must rasterize");
+        // Bold and italic faces are distinct from regular (real attribute
+        // rendering, not faux-styling): a wide glyph rasterizes in each.
+        for s in [FontStyle::Bold, FontStyle::Italic, FontStyle::BoldItalic] {
+            assert!(r.glyph('W', s, FONT_PX).w > 0, "styled face must rasterize");
+        }
+    }
+
+    #[test]
+    fn shortcuts_map_per_platform() {
+        let c = Key::Character("c".into());
+        let dot = Key::Character(".".into());
+        let cmd = ModifiersState::SUPER;
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+
+        // A bare keystroke is never a shortcut on any platform (it goes to the
+        // PTY).
+        assert_eq!(match_shortcut(ModifiersState::empty(), &c), None);
+
+        if cfg!(target_os = "macos") {
+            // ⌘ is the mac modifier; Ctrl+Shift is not.
+            assert_eq!(match_shortcut(cmd, &c), Some(Shortcut::Copy));
+            assert_eq!(match_shortcut(cmd, &dot), Some(Shortcut::Stop));
+            assert_eq!(match_shortcut(ctrl_shift, &c), None);
+        } else {
+            // Ctrl+Shift is the modifier elsewhere; ⌘ doesn't exist.
+            assert_eq!(match_shortcut(ctrl_shift, &c), Some(Shortcut::Copy));
+            assert_eq!(match_shortcut(cmd, &c), None);
+        }
     }
 }

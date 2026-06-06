@@ -25,6 +25,12 @@ const SAMPLE: &str = concat!(
     "\x1b[32m   Compiling\x1b[0m sugar v0.1.0\r\n",
     "\x1b[32m    Finished\x1b[0m test profile in 1.21s\r\n",
     "\x1b[31merror\x1b[0m: something went \x1b[1;31mwrong\x1b[0m on line 42\r\n",
+    // Showcase the face/attribute rendering: bold, italic, underline, dim,
+    // strikeout, a powerline separator, and emoji (Noto Emoji fallback).
+    "\x1b[1mbold\x1b[0m \x1b[3mitalic\x1b[0m \x1b[1;3mbold-italic\x1b[0m ",
+    "\x1b[4munderline\x1b[0m \x1b[9mstrikeout\x1b[0m \x1b[2mdim\x1b[0m\r\n",
+    "\x1b[7;34m\x1b[0m\x1b[44;30m master \x1b[0m\x1b[34;42m\x1b[0m\x1b[42;30m \u{2713} \x1b[0m\x1b[32m\x1b[0m\r\n",
+    "emoji: \u{1F680} \u{1F525} \u{2705} \u{1F4A1} \u{2764} done\r\n",
     "\x1b[1;32mliam@rand\x1b[0m:\x1b[1;34m~/diabetes/sugar\x1b[0m$ \u{2588}\r\n",
 );
 
