@@ -165,8 +165,6 @@ impl Tree {
                     depth,
                     name: n.name.clone(),
                     is_group,
-                    expanded: n.expanded,
-                    has_children: !n.children.is_empty(),
                 });
                 if is_group && n.expanded {
                     go(t, c, depth + 1, out);
@@ -244,8 +242,6 @@ struct Row {
     depth: usize,
     name: String,
     is_group: bool,
-    expanded: bool,
-    has_children: bool,
 }
 
 /// Expand `~` / `~/...` to `$HOME`. Pure given `home`.
@@ -1044,15 +1040,10 @@ const SEL: u32 = 0x2f_5d_6e; // selection fill (white text stays readable)
 // left-aligned titles.
 const SIDEBAR_W: usize = 212; // fixed-width tree pane
 const HEADER_H: usize = 24; // title bar over the terminal & sidebar head
-const ROW_H: usize = 20; // one tree row
-const INDENT: usize = 14; // px added per tree depth
-const EXPANDER_W: usize = 14; // width of the expander / leaf-marker column
-const TPAD: usize = 7; // left gutter inside the tree, so rows clear the pane edge
-const MARK_GAP: usize = 5; // gap between the marker column and the row label
+const ROW_H: usize = 20; // context-menu item height
 const CTX_W: usize = 124; // context-menu width
 const RPANEL_W: usize = 252; // right inspector pane width
 const WBTN_W: usize = 30; // min/max/close button width
-const INFO_H: usize = 24; // sidebar "info" toggle band, below WORKSPACE
 const EDGE: f64 = 5.0; // borderless-window resize-grip thickness
 
 // Black chrome with white text. The Win2k bevel structure is kept but recolored
@@ -1066,7 +1057,6 @@ const BEVEL_LT: u32 = 0x3a_3a_3a; // raised highlight (top/left)
 const BEVEL_DK: u32 = 0x00_00_00; // raised shadow (bottom/right)
 const INK: u32 = 0xf0_f0_f0; // primary chrome text (white)
 const INK_DIM: u32 = 0xa0_a0_a0; // secondary chrome text (gray)
-const RUN_INK: u32 = 0x3f_d0_4f; // "running" marker (green square)
 
 /// Map a terminal color to RGB. A compact, good-enough palette.
 fn rgb(color: Color, default: u32) -> u32 {
@@ -1496,7 +1486,6 @@ impl State {
             &mut self.renderer,
             &rows,
             sel,
-            &self.sessions,
             self.inspector,
         );
 
@@ -1617,18 +1606,17 @@ impl State {
     }
 
     /// Hit-test a point against the sidebar tree. Returns the row's node id and
-    /// whether the hit landed on a group's expander box.
+    /// whether the row is a group (a group click folds/unfolds it — there is no
+    /// separate expander glyph to target). Mirrors the cell-grid layout in
+    /// `draw_sidebar`.
     fn sidebar_hit(&self, x: f64, y: f64, rows: &[Row]) -> Option<(NodeId, bool)> {
-        let top = HEADER_H + INFO_H + 1; // header band + info-toggle band + divider
-        if x >= SIDEBAR_W as f64 || y < top as f64 {
+        let rh = self.renderer.cell_h;
+        if x >= SIDEBAR_W as f64 || y < HEADER_H as f64 {
             return None;
         }
-        let i = (y as usize - top) / ROW_H;
+        let i = (y as usize - HEADER_H) / rh;
         let row = rows.get(i)?;
-        let mark_x = TPAD + row.depth * INDENT;
-        let on_expander =
-            row.is_group && (x as usize) >= mark_x && (x as usize) < mark_x + EXPANDER_W;
-        Some((row.id, on_expander))
+        Some((row.id, row.is_group))
     }
 }
 
@@ -2376,9 +2364,9 @@ fn hline(
     }
 }
 
-/// The left tree pane: a recessed panel with a Win2k head, one fixed-height
-/// bevelled row per visible node, boxed `[+]/[-]` expanders for groups, a
-/// run-state marker for leaves, and a raised selection highlight.
+/// The left tree pane, rendered as plain monospace text on the terminal's own
+/// cell grid: one row per visible node at the terminal line height, indented by
+/// depth with no markers, and a filled background for the selected row.
 fn draw_sidebar(
     buf: &mut [u32],
     pw: usize,
@@ -2386,103 +2374,41 @@ fn draw_sidebar(
     r: &mut Renderer,
     rows: &[Row],
     selected: NodeId,
-    sessions: &HashMap<NodeId, Session>,
     inspector: bool,
 ) {
     fill_rect(buf, pw, ph, 0, 0, SIDEBAR_W, ph, STRIP_BG);
-    // Header band, matching the terminal header height.
+    // Title-bar band, shared with the terminal header so the top strip reads as
+    // one continuous bar; holds the latched info toggle.
     vgradient(buf, pw, ph, 0, 0, SIDEBAR_W, HEADER_H, HEAD_HI, HEAD_LO);
     fill_rect(buf, pw, ph, 0, 0, SIDEBAR_W, 1, BEVEL_LT);
     fill_rect(buf, pw, ph, 0, HEADER_H - 1, SIDEBAR_W, 1, BEVEL_DK);
-    // (No "WORKSPACE" header label — intentionally hidden.)
-    // Text sits centred within a *row*, not the taller header band, so glyphs
-    // never ride low against the row below.
-    let ty = ROW_H.saturating_sub(r.cell_h) / 2;
-    // Hard divider between the pane and the terminal.
+    // 1px divider between the pane and the terminal.
     fill_rect(buf, pw, ph, SIDEBAR_W - 1, 0, 1, ph, BEVEL_DK);
-    // Latched info icon directly below the WORKSPACE head, on its own toolbar
-    // band: a subtle gradient + bottom divider sets the "toolbar" off from the
-    // list so the icon doesn't float in empty space.
-    vgradient(buf, pw, ph, 0, HEADER_H, SIDEBAR_W, INFO_H, HEAD_HI, HEAD_LO);
-    fill_rect(buf, pw, ph, 0, HEADER_H + INFO_H - 1, SIDEBAR_W, 1, BEVEL_DK);
-    fill_rect(buf, pw, ph, 0, HEADER_H + INFO_H, SIDEBAR_W, 1, BEVEL_LT);
     draw_info_icon(buf, pw, ph, info_btn(), inspector);
 
+    // The tree is just monospace text on the terminal's own cell grid: one row
+    // per node at the terminal line height, columns on the cell width, drawn
+    // flush-left with no bevels, boxes or padding. The list begins at HEADER_H,
+    // so a sidebar row lines up pixel-for-pixel with the terminal row beside it.
+    // Selection is a filled background, exactly how the terminal highlights its
+    // own selected cells.
+    let (cw, rh) = (r.cell_w, r.cell_h);
     for (i, row) in rows.iter().enumerate() {
-        let y = HEADER_H + INFO_H + 1 + i * ROW_H;
-        if y + ROW_H > ph {
+        let y = HEADER_H + i * rh;
+        if y + rh > ph {
             break;
         }
-        let ind = row.depth * INDENT;
-        // One column grid shared by groups and leaves: a fixed left gutter, the
-        // marker column, a gap, then the label — so every label at a given
-        // depth lines up regardless of node kind.
-        let mark_x = TPAD + ind;
-        let text_x = mark_x + EXPANDER_W + MARK_GAP;
-        let text_w = SIDEBAR_W.saturating_sub(text_x + TPAD);
         let is_sel = row.id == selected;
         if is_sel {
-            // A flat raised bar (top highlight + bottom shadow) with a coloured
-            // accent down the left edge — reads as a selected list row, not a
-            // detached button.
-            vgradient(buf, pw, ph, 1, y, SIDEBAR_W - 2, ROW_H, PANEL_HI, PANEL_LO);
-            fill_rect(buf, pw, ph, 1, y, SIDEBAR_W - 2, 1, BEVEL_LT);
-            fill_rect(buf, pw, ph, 1, y + ROW_H - 1, SIDEBAR_W - 2, 1, BEVEL_DK);
-            fill_rect(buf, pw, ph, 1, y, 3, ROW_H, SEL);
+            fill_rect(buf, pw, ph, 0, y, SIDEBAR_W - 1, rh, SEL);
         }
-        let gy = y + ty;
-        if row.is_group {
-            // Boxed expander, classic tree control — a tidy square centred in
-            // the marker column.
-            let bw = EXPANDER_W - 4;
-            let bx = mark_x + (EXPANDER_W - bw) / 2;
-            let by = y + (ROW_H - bw) / 2;
-            stroke_rect(buf, pw, ph, bx, by, bw, bw, BEVEL_DK);
-            let mark = if row.expanded { "-" } else { "+" };
-            let glyph_ok = row.has_children;
-            draw_text(
-                buf,
-                pw,
-                ph,
-                r,
-                bx + 1,
-                gy,
-                EXPANDER_W,
-                if glyph_ok { mark } else { " " },
-                INK,
-            );
-            draw_text(buf, pw, ph, r, text_x, gy, text_w, &row.name, INK);
-        } else {
-            let live = sessions.contains_key(&row.id);
-            let running = sessions
-                .get(&row.id)
-                .map(|s| observe(s.shell_pid).foreground)
-                .unwrap_or(false);
-            // Run-state marker drawn (not a font glyph) so it stays a crisp,
-            // fixed size and centres in the same column as the expander box:
-            // filled square = running, hollow square = live/idle, small dot =
-            // not live.
-            let cx = mark_x + EXPANDER_W / 2;
-            let cy = y + ROW_H / 2;
-            if running {
-                fill_rect(buf, pw, ph, cx - 3, cy - 3, 7, 7, RUN_INK);
-            } else if live {
-                stroke_rect(buf, pw, ph, cx - 4, cy - 4, 8, 8, INK_DIM);
-            } else {
-                fill_rect(buf, pw, ph, cx - 1, cy - 1, 3, 3, INK_DIM);
-            }
-            draw_text(
-                buf,
-                pw,
-                ph,
-                r,
-                text_x,
-                gy,
-                text_w,
-                &row.name,
-                if is_sel { INK } else { INK_DIM },
-            );
-        }
+        // No markers: hierarchy is the indentation alone (one character per
+        // depth level). Groups stay full-ink, leaves dim, so the structure
+        // still reads at a glance.
+        let name_x = row.depth * cw;
+        let name_w = SIDEBAR_W.saturating_sub(name_x);
+        let color = if is_sel || row.is_group { INK } else { INK_DIM };
+        draw_text(buf, pw, ph, r, name_x, y, name_w, &row.name, color);
     }
 }
 
@@ -2696,11 +2622,11 @@ fn win_btns(pw: usize) -> [Rect; 3] {
     ]
 }
 
-/// The latched info icon — a small square box, left-aligned in its own band
-/// directly below the WORKSPACE head. Filled = the inspector pane is shown.
+/// The latched info icon — a small square box tucked into the left of the
+/// title-bar band, above the tree. Filled = the inspector pane is shown.
 fn info_btn() -> Rect {
-    let s = INFO_H - 8; // square side
-    (TPAD, HEADER_H + (INFO_H - s) / 2, s, s)
+    let s = HEADER_H - 10; // square side, inset within the title-bar band
+    (5, (HEADER_H - s) / 2, s, s)
 }
 
 /// `[title, command, directory]` boxes inside the inspector pane, in
@@ -3242,18 +3168,18 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
-                        // 7. Sidebar: expander toggles fold, row selects.
+                        // 7. Sidebar: a click selects the row; a group click
+                        // also folds/unfolds it (there is no separate expander).
                         let rows = self.state.as_ref().unwrap().tree.rows();
-                        if let Some((node, on_exp)) =
+                        if let Some((node, is_group)) =
                             self.state.as_ref().unwrap().sidebar_hit(mx, my, &rows)
                         {
                             let st = self.state.as_mut().unwrap();
-                            if on_exp {
+                            st.selected = node;
+                            st.focus = None;
+                            if is_group {
                                 let e = &mut st.tree.nodes[node].expanded;
                                 *e = !*e;
-                            } else {
-                                st.selected = node;
-                                st.focus = None;
                             }
                             st.request_redraw();
                             return;

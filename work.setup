@@ -1,0 +1,40 @@
+~/.apps
+	./run-llama.sh
+~/Music
+	hermes
+	nano wanted
+~/Documents/projects/diabetes
+	./mealplanner
+		bun run main.ts
+	./sugar
+		./run.sh
+	./mealplanner
+		bash
+~/Documents/papers
+	bash
+~/Dropbox/Notes/Obsidian/consumption/Podcasts/podcast-learn
+	bash
+
+
+
+workspaces
+	Apps
+		"qwen"	~/.apps	./run-llama.sh
+	Music
+		"Hermes chat"	~/Music	hermes
+		"Wanted music"	~/Music	"nano wanted"
+	Diabetes
+		"Meal planner"	~/Documents/projects/diabetes/mealplanner	"bun run main.ts"
+		"Sugar tracker"	~/Documents/projects/diabetes/sugar	./run.sh
+		"Diabetes 3"	~/Documents/projects/diabetes/mealplanner	bash
+	Morphology
+		"morpheus"	~/Documents/projects/morpheus	bash
+	HTGAA
+		"website"	~/Documents/projects/webpages	bash
+	Study
+		"Papers"	~/Documents/papers	bash
+		"Podcasts"	~/Dropbox/Notes/Obsidian/consumption/Podcasts/podcast-learn	bash
+	Scratch
+		"Dev"	~/Documents/projects/termem/project2
+		"Scratch 2"	~/Documents/projects/termem/project2
+	Transient
