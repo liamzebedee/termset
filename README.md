@@ -6,9 +6,15 @@ Terminal workspaces for multitasking devs.
 - Store your terminal layout in a text file, that you can commit into git and open the same on your other devices
 - Re-open the same Claude code instances for different projects
 
-Manyterm running a full-stack workspace](demo/screenshot.png)
+## Usage
 
-`demo/terminal.workspace`:
+```
+$ mtm term.workspace
+```
+
+[Manyterm running a full-stack workspace](demo/screenshot.png)
+
+`term.workspace`:
 
 ```sh
 workspaces
