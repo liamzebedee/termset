@@ -525,6 +525,8 @@ enum Shortcut {
     Start,
     Stop,
     ToggleSidebar,
+    OpenConfig,
+    Quit,
 }
 
 /// Map a modified keystroke to a [`Shortcut`], or `None` to pass it through to
@@ -533,13 +535,15 @@ enum Shortcut {
 /// * **macOS** uses ⌘ (Command), like every native mac app: ⌘C copy, ⌘V paste,
 ///   ⌘T new tab, ⌘W close, ⌘↑/⌘↓ select previous/next tree node, ⌘←/⌘→
 ///   collapse/expand the selected group, ⌘R run/start, ⌘. stop, ⌘B toggle the
-///   sidebar. ⌘ never collides with the shell's own Ctrl- control codes, so all
-///   of these are safe to claim.
+///   sidebar, ⌘, open the config file, ⌘Q quit. ⌘ never collides with the
+///   shell's own Ctrl- control codes, so all of these are safe to claim.
 /// * **Elsewhere** there is no ⌘, so the terminal convention Ctrl+Shift is used
 ///   (plain Ctrl+C etc. must stay free for the shell): Ctrl+Shift+C/V/T/W for
 ///   copy/paste/new/close, Ctrl+Shift+↑/↓ select previous/next node,
 ///   Ctrl+Shift+←/→ collapse/expand the selected group, Ctrl+Shift+B toggle the
-///   sidebar, Ctrl+Shift+S start, Ctrl+Shift+X stop.
+///   sidebar, Ctrl+Shift+S start, Ctrl+Shift+X stop, Ctrl+Shift+, open the
+///   config file, Ctrl+Shift+Q quit. (Shift+`,` reports as `<` on many layouts,
+///   so both are accepted.)
 fn match_shortcut(mods: ModifiersState, key: &Key) -> Option<Shortcut> {
     let ch = |name: &str| matches!(key, Key::Character(c) if c.eq_ignore_ascii_case(name));
     #[cfg(target_os = "macos")]
@@ -561,6 +565,8 @@ fn match_shortcut(mods: ModifiersState, key: &Key) -> Option<Shortcut> {
             Key::Named(NamedKey::ArrowRight) => Shortcut::Expand,
             _ if ch("b") => Shortcut::ToggleSidebar,
             _ if ch("r") => Shortcut::Start,
+            _ if ch(",") => Shortcut::OpenConfig,
+            _ if ch("q") => Shortcut::Quit,
             _ => return None,
         })
     }
@@ -581,6 +587,9 @@ fn match_shortcut(mods: ModifiersState, key: &Key) -> Option<Shortcut> {
             _ if ch("b") => Shortcut::ToggleSidebar,
             _ if ch("s") => Shortcut::Start,
             _ if ch("x") => Shortcut::Stop,
+            // Shift+`,` is `<` on most layouts; accept either.
+            _ if ch(",") || ch("<") => Shortcut::OpenConfig,
+            _ if ch("q") => Shortcut::Quit,
             _ => return None,
         })
     }
@@ -1040,15 +1049,15 @@ const SEL: u32 = 0x2f_5d_6e; // selection fill (white text stays readable)
 // bevels, a subtle vertical gradient, compact fixed heights, dense layout,
 // left-aligned titles.
 // The sidebar auto-sizes to its content: the longest label plus this fixed
-// right margin (see `State::sidebar_w`). It is never narrower than the header
-// info button. A toggle (⌘B / Ctrl+Shift+B) hides it entirely (width 0).
+// right margin (see `State::sidebar_w`). It is never narrower than `WBTN_W`. A
+// toggle (⌘B / Ctrl+Shift+B) hides it entirely (width 0).
 const SIDEBAR_MARGIN: usize = 16; // fixed gap right of the longest label
 const SIDEBAR_PAD_L: usize = 6; // small left inset before each tree label
 const HEADER_H: usize = 16; // title bar; one content row tall (= cell_h at FONT_PX) for uniform heights
 const ROW_H: usize = 20; // context-menu item height
 const CTX_W: usize = 124; // context-menu width
 const RPANEL_W: usize = 252; // right inspector pane width
-const WBTN_W: usize = 30; // info-button width (the latched "i" on the left)
+const WBTN_W: usize = 30; // minimum sidebar width (also the old info-button width)
 const TLIGHT_CELL: usize = 18; // per-dot hit cell for the window controls
 const TLIGHT_R: f32 = 5.0; // traffic-light dot radius (px); diameter 10 in a 16px row
 const EDGE: f64 = 5.0; // borderless-window resize-grip thickness
@@ -1517,7 +1526,6 @@ impl State {
                 &mut self.renderer,
                 &rows,
                 sel,
-                self.inspector,
                 sw,
             );
         }
@@ -1609,11 +1617,11 @@ impl State {
             .find(|l| self.sessions.contains_key(l))
     }
 
-    /// Logical width of the sidebar pane: `0` when hidden, otherwise the
-    /// longest label plus a fixed right margin (never narrower than the header
-    /// info button). All chrome geometry and hit-testing derive from this, so
-    /// the pane grows and shrinks to fit its content and vanishes when toggled
-    /// off.
+    /// Logical width of the sidebar pane: `0` when hidden, otherwise the left
+    /// label inset plus the longest label plus a fixed right margin (never
+    /// narrower than the header info button). All chrome geometry and
+    /// hit-testing derive from this, so the pane grows and shrinks to fit its
+    /// content and vanishes when toggled off.
     fn sidebar_w(&self) -> usize {
         if !self.sidebar_visible {
             return 0;
@@ -1625,7 +1633,7 @@ impl State {
             .map(|row| row.name.chars().count() * self.renderer.cell_w)
             .max()
             .unwrap_or(0);
-        label_px.max(WBTN_W) + SIDEBAR_MARGIN
+        (SIDEBAR_PAD_L + label_px).max(WBTN_W) + SIDEBAR_MARGIN
     }
 
     /// Grid size for the terminal area (window minus sidebar, header and —
@@ -1858,6 +1866,41 @@ impl App {
         }
     }
 
+    /// Open the workspace/config file in a new scratch tab, editing it in
+    /// `nano`. The terminal equivalent of an editor's ⌘, — there is no separate
+    /// settings UI, the workspace file *is* the config. The tab is a normal
+    /// dynamic leaf, so ⌘W closes it.
+    fn open_config(&mut self) {
+        let path = self.ws_path.clone();
+        let dir = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(home_dir);
+        let command = format!("nano {}", shell_quote(&path));
+        let node = {
+            let Some(st) = self.state.as_mut() else { return };
+            let group = st.tree.group_for_new(st.selected);
+            let node = st.tree.push(
+                Some(group),
+                "config".to_string(),
+                Kind::Leaf {
+                    workdir: dir,
+                    command,
+                },
+                true,
+            );
+            st.tree.nodes[group].expanded = true;
+            st.selected = node;
+            node
+        };
+        // Spawn the shell and run the editor in it (the planner does both).
+        self.start(node);
+        self.save_workspace();
+        if let Some(st) = &self.state {
+            st.request_redraw();
+        }
+    }
+
     /// Tear down the selected session. Dynamic (scratch) leaves are removed
     /// from the tree; spec leaves stay so they can be re-started.
     fn close_selected(&mut self) {
@@ -1944,6 +1987,9 @@ impl App {
 
     /// Toggle the right inspector pane (and reflow the terminal into the
     /// freed/used space). Hiding it drops keyboard focus back to the PTY.
+    /// Currently unwired — the info button that drove it was removed; kept so
+    /// re-adding the trigger is a one-liner.
+    #[allow(dead_code)]
     fn toggle_inspector(&mut self) {
         if let Some(st) = self.state.as_mut() {
             st.inspector = !st.inspector;
@@ -2523,20 +2569,16 @@ fn draw_sidebar(
     r: &mut Renderer,
     rows: &[Row],
     selected: NodeId,
-    inspector: bool,
     sidebar_w: usize,
 ) {
     fill_rect(buf, pw, ph, 0, 0, sidebar_w, ph, STRIP_BG);
     // Title-bar band, shared with the terminal header so the top strip reads as
-    // one continuous bar; holds the latched info toggle.
+    // one continuous bar.
     vgradient(buf, pw, ph, 0, 0, sidebar_w, HEADER_H, HEAD_HI, HEAD_LO);
     fill_rect(buf, pw, ph, 0, 0, sidebar_w, 1, BEVEL_LT);
     fill_rect(buf, pw, ph, 0, HEADER_H - 1, sidebar_w, 1, BEVEL_DK);
     // 1px divider between the pane and the terminal.
     fill_rect(buf, pw, ph, sidebar_w - 1, 0, 1, ph, BEVEL_DK);
-    // Info toggle: the same kind of text button as the window controls, latched
-    // (drawn pressed) while the inspector pane is open.
-    draw_button(buf, pw, ph, r, info_btn(), "i", inspector, true);
 
     // The tree is just monospace text on the terminal's own cell grid: one row
     // per node at the terminal line height, columns on the cell width, drawn
@@ -2553,12 +2595,25 @@ fn draw_sidebar(
         }
         let is_sel = row.id == selected;
         if is_sel {
+            // The selection band still spans the full pane; only the label text
+            // is inset, so the highlight stays edge-to-edge.
             fill_rect(buf, pw, ph, 0, y, sidebar_w - 1, rh, SEL);
         }
-        // No indentation or markers: every node sits flush against the left
-        // edge. Hierarchy reads from colour alone — groups full-ink, leaves dim.
+        // No markers: hierarchy reads from colour alone — groups full-ink,
+        // leaves dim. Labels carry a small left inset (`SIDEBAR_PAD_L`) so the
+        // text doesn't sit flush against the pane edge.
         let color = if is_sel || row.is_group { INK } else { INK_DIM };
-        draw_text(buf, pw, ph, r, 0, y, sidebar_w, &row.name, color);
+        draw_text(
+            buf,
+            pw,
+            ph,
+            r,
+            SIDEBAR_PAD_L,
+            y,
+            sidebar_w.saturating_sub(SIDEBAR_PAD_L),
+            &row.name,
+            color,
+        );
     }
 }
 
@@ -2777,12 +2832,6 @@ fn win_btns(pw: usize) -> [Rect; 3] {
     ]
 }
 
-/// The latched info "i" button, flush to the window's top-left — mirrors the
-/// window controls on the right. Drawn pressed while the inspector is shown.
-fn info_btn() -> Rect {
-    (0, 0, WBTN_W, HEADER_H)
-}
-
 /// `[title, command, directory]` boxes inside the inspector pane, in
 /// `Field::ALL` order (so `Field::index` is the row index here).
 fn field_rects(pw: usize, cell_h: usize) -> [Rect; 3] {
@@ -2891,6 +2940,12 @@ fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// Single-quote a path for safe interpolation into a shell command line
+/// (handles spaces and other metacharacters; embedded `'` is escaped).
+fn shell_quote(p: &Path) -> String {
+    format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"))
 }
 
 /// Which workspace file to use: the first CLI argument if given (a leading
@@ -3279,15 +3334,7 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
-                        // 3. The sidebar "info" toggle (only live while the
-                        // sidebar — which hosts the button — is shown).
-                        if self.state.as_ref().unwrap().sidebar_visible
-                            && hit(info_btn(), mx, my)
-                        {
-                            self.toggle_inspector();
-                            return;
-                        }
-                        // 4. Inspector pane: focus a field, else defocus.
+                        // 3. Inspector pane: focus a field, else defocus.
                         if self.state.as_ref().unwrap().inspector
                             && mx >= panel_x(pw) as f64
                         {
@@ -3305,15 +3352,14 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
-                        // 5. Borderless-window resize grips (real window edge,
-                        // so full dims + raw window-space pointer).
-                        if let Some(dir) = resize_dir(fw, fh, rmx, rmy) {
+                        // 4. Borderless-window resize grips.
+                        if let Some(dir) = resize_dir(pw, ph, mx, my) {
                             if let Some(w) = &self.state.as_ref().unwrap().window {
                                 let _ = w.drag_resize_window(dir);
                             }
                             return;
                         }
-                        // 6. The header row (anywhere else): double-click
+                        // 5. The header row (anywhere else): double-click
                         // toggles maximize/restore (like a native title bar);
                         // a single click drags the window.
                         if my < HEADER_H as f64 {
@@ -3337,7 +3383,7 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
-                        // 7. Sidebar: a click selects the row; a group click
+                        // 6. Sidebar: a click selects the row; a group click
                         // also folds/unfolds it (there is no separate expander).
                         let rows = self.state.as_ref().unwrap().tree.rows();
                         if let Some((node, is_group)) =
@@ -3353,7 +3399,7 @@ impl ApplicationHandler<UserEvent> for App {
                             st.request_redraw();
                             return;
                         }
-                        // 8. Terminal area: start a text selection.
+                        // 7. Terminal area: start a text selection.
                         let tr = term_right(pw, self.state.as_ref().unwrap().inspector);
                         let sw = self.state.as_ref().unwrap().sidebar_w();
                         if mx >= sw as f64
@@ -3467,6 +3513,8 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                         Shortcut::ToggleSidebar => self.toggle_sidebar(),
+                        Shortcut::OpenConfig => self.open_config(),
+                        Shortcut::Quit => event_loop.exit(),
                     }
                     return;
                 }
@@ -3893,6 +3941,9 @@ mod tests {
     fn shortcuts_map_per_platform() {
         let c = Key::Character("c".into());
         let dot = Key::Character(".".into());
+        let q = Key::Character("q".into());
+        let comma = Key::Character(",".into());
+        let lt = Key::Character("<".into()); // Shift+`,` on most layouts
         let cmd = ModifiersState::SUPER;
         let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
 
@@ -3904,10 +3955,16 @@ mod tests {
             // ⌘ is the mac modifier; Ctrl+Shift is not.
             assert_eq!(match_shortcut(cmd, &c), Some(Shortcut::Copy));
             assert_eq!(match_shortcut(cmd, &dot), Some(Shortcut::Stop));
+            assert_eq!(match_shortcut(cmd, &q), Some(Shortcut::Quit));
+            assert_eq!(match_shortcut(cmd, &comma), Some(Shortcut::OpenConfig));
             assert_eq!(match_shortcut(ctrl_shift, &c), None);
         } else {
             // Ctrl+Shift is the modifier elsewhere; ⌘ doesn't exist.
             assert_eq!(match_shortcut(ctrl_shift, &c), Some(Shortcut::Copy));
+            assert_eq!(match_shortcut(ctrl_shift, &q), Some(Shortcut::Quit));
+            // Both `,` and its shifted `<` open the config.
+            assert_eq!(match_shortcut(ctrl_shift, &comma), Some(Shortcut::OpenConfig));
+            assert_eq!(match_shortcut(ctrl_shift, &lt), Some(Shortcut::OpenConfig));
             assert_eq!(match_shortcut(cmd, &c), None);
         }
     }

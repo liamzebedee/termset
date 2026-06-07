@@ -3,13 +3,10 @@ manyterm
 
 Terminal workspaces for multitasking devs.
 
-- A terminal with vertical tabs, and organised groups for different projects.
-- Where the terminal layout is a simple text file.
-- That you can open/close cross-device.
+- Store your terminal layout in a text file, that you can commit into git and open the same on your other devices
+- Re-open the same Claude code instances for different projects
 
-Put your Claude Code tabs next to each project, and multi-task seamlessly. 
-
-![manyterm running a full-stack workspace](demo/screenshot.png)
+Manyterm running a full-stack workspace](demo/screenshot.png)
 
 `demo/terminal.workspace`:
 
