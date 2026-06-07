@@ -13,7 +13,7 @@ Terminal workspaces for multitasking devs.
 $ mtm term.workspace
 ```
 
-[Manyterm running a full-stack workspace](demo/screenshot.png)
+![Manyterm running a full-stack workspace](demo/screenshot.png)
 
 `term.workspace`:
 
