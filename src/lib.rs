@@ -1039,7 +1039,7 @@ const SEL: u32 = 0x2f_5d_6e; // selection fill (white text stays readable)
 // bevels, a subtle vertical gradient, compact fixed heights, dense layout,
 // left-aligned titles.
 const SIDEBAR_W: usize = 212; // fixed-width tree pane
-const HEADER_H: usize = 24; // title bar over the terminal & sidebar head
+const HEADER_H: usize = 16; // title bar; one content row tall (= cell_h at FONT_PX) for uniform heights
 const ROW_H: usize = 20; // context-menu item height
 const CTX_W: usize = 124; // context-menu width
 const RPANEL_W: usize = 252; // right inspector pane width
@@ -1467,11 +1467,12 @@ impl State {
         let maxed = self.window.as_ref().is_some_and(|w| w.is_maximized());
         let [bmin, bmax, bclose] = win_btns(pw);
 
-        // Window controls, right-aligned in the header row.
+        // Window controls, right-aligned in the header row. Plain ASCII glyphs
+        // from the primary mono face, so all controls share one font and size.
         for (rect, label) in [
-            (bmin, "\u{2013}"),                                // –  minimize
-            (bmax, if maxed { "x" } else { "\u{25a1}" }), // □ / x (restore — placeholder)
-            (bclose, "\u{2715}"),                              // ✕  close
+            (bmin, "_"),                       // minimize (a bar at the bottom)
+            (bmax, if maxed { "][" } else { "[]" }), // maximize / restore
+            (bclose, "x"),                     // close
         ] {
             draw_button(&mut buf, pw, ph, &mut self.renderer, rect, label, false, true);
         }
@@ -2384,7 +2385,9 @@ fn draw_sidebar(
     fill_rect(buf, pw, ph, 0, HEADER_H - 1, SIDEBAR_W, 1, BEVEL_DK);
     // 1px divider between the pane and the terminal.
     fill_rect(buf, pw, ph, SIDEBAR_W - 1, 0, 1, ph, BEVEL_DK);
-    draw_info_icon(buf, pw, ph, info_btn(), inspector);
+    // Info toggle: the same kind of text button as the window controls, latched
+    // (drawn pressed) while the inspector pane is open.
+    draw_button(buf, pw, ph, r, info_btn(), "i", inspector, true);
 
     // The tree is just monospace text on the terminal's own cell grid: one row
     // per node at the terminal line height, columns on the cell width, drawn
@@ -2466,21 +2469,6 @@ fn draw_button(
     let tx = x + w.saturating_sub(tw) / 2 + off;
     let ty = y + h.saturating_sub(r.cell_h) / 2 + off;
     draw_text(buf, pw, ph, r, tx, ty, w, label, if enabled { INK } else { INK_DIM });
-}
-
-/// A small square info icon (1px border, a drawn "i"). Not a button: no
-/// bevel/gradient. `active` inverts it (filled box, light glyph) to show the
-/// inspector pane is open.
-fn draw_info_icon(buf: &mut [u32], pw: usize, ph: usize, rect: Rect, active: bool) {
-    let (x, y, w, h) = rect;
-    let (face, glyph) = if active { (INK, BG) } else { (BG, INK) };
-    fill_rect(buf, pw, ph, x, y, w, h, face);
-    stroke_rect(buf, pw, ph, x, y, w, h, INK);
-    // The "i": a dot near the top and a stem below, both centered.
-    let d = (w / 6).max(2);
-    let cx = x + (w - d) / 2;
-    fill_rect(buf, pw, ph, cx, y + h / 5, d, d, glyph);
-    fill_rect(buf, pw, ph, cx, y + h * 2 / 5, d, h * 2 / 5, glyph);
 }
 
 /// A sunken Win2k text box. `focused` draws the caret; `enabled` is false for
@@ -2622,11 +2610,10 @@ fn win_btns(pw: usize) -> [Rect; 3] {
     ]
 }
 
-/// The latched info icon — a small square box tucked into the left of the
-/// title-bar band, above the tree. Filled = the inspector pane is shown.
+/// The latched info "i" button, flush to the window's top-left — mirrors the
+/// window controls on the right. Drawn pressed while the inspector is shown.
 fn info_btn() -> Rect {
-    let s = HEADER_H - 10; // square side, inset within the title-bar band
-    (5, (HEADER_H - s) / 2, s, s)
+    (0, 0, WBTN_W, HEADER_H)
 }
 
 /// `[title, command, directory]` boxes inside the inspector pane, in
