@@ -775,8 +775,6 @@ enum UserEvent {
     /// Glyph-coverage fonts (emoji + OS CJK/symbol faces) finished loading on a
     /// worker thread — swap them into the renderer so later frames cover more.
     FallbackFonts(Vec<fontdue::Font>),
-    /// TEMP DEBUG: force a window resize to (w,h) physical px.
-    TestResize(u32, u32),
 }
 
 /// `EventListener` impl handed to `alacritty_terminal`. Forwards the events we
@@ -3278,7 +3276,6 @@ impl ApplicationHandler<UserEvent> for App {
         let st = self.state.as_mut().unwrap();
         let (lw, lh) = st.logical_size();
         let size = st.grid_size(lw, lh);
-        eprintln!("DBG spawn-time: phys={:?} logical=({lw},{lh}) grid=({},{}) cell=({},{})", st.phys, size.cols, size.lines, st.renderer.cell_w, st.renderer.cell_h);
 
         // On open: an idle PTY per spec leaf — cwd set, no command run.
         let leaves = st.tree.leaves(st.tree.root);
@@ -3309,19 +3306,6 @@ impl ApplicationHandler<UserEvent> for App {
         // background. It's hidden from the sidebar until it's the active tab
         // (see `Tree::rows`), so ⌘, / Ctrl+Shift+, reveals an already-open nano.
         self.ensure_config_node();
-
-        // TEMP DEBUG: simulate a WM resize after the prompt is drawn.
-        if let Ok(spec) = std::env::var("TV_RESIZE") {
-            if let Some((w, h)) = spec.split_once('x') {
-                if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
-                    let proxy = self.proxy.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(1300));
-                        let _ = proxy.send_event(UserEvent::TestResize(w, h));
-                    });
-                }
-            }
-        }
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -3391,14 +3375,6 @@ impl ApplicationHandler<UserEvent> for App {
                     st.request_redraw();
                 }
             }
-            UserEvent::TestResize(w, h) => {
-                if let Some(st) = self.state.as_ref() {
-                    if let Some(win) = &st.window {
-                        eprintln!("DBG TestResize -> request {w}x{h}");
-                        let _ = win.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
-                    }
-                }
-            }
         }
     }
 
@@ -3410,8 +3386,7 @@ impl ApplicationHandler<UserEvent> for App {
             // OS runs its own modal loop, so a queued `request_redraw` isn't
             // serviced until the drag ends — leaving a frozen, stretched frame.
             // Drawing here makes the content track the window edge live instead.
-            WindowEvent::Resized(sz) => {
-                eprintln!("DBG Resized: {:?}", sz);
+            WindowEvent::Resized(_) => {
                 self.relayout();
                 self.redraw();
             }

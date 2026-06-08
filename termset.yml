@@ -53,3 +53,5 @@ groups:
   sessions:
   - name: Transient 1
     dir: '~'
+  - name: Transient 2
+    dir: '~'

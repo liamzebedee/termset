@@ -6,6 +6,8 @@
 - Re-open the same Claude Code instances for different projects
 - Work with your locally-developed software setups without long-lived Terminal instances
 
+Termset is a terminal app, written in Rust. It uses [Alacritty](https://github.com/alacritty/alacritty), a fast cross-platform OpenGL terminal emulator under the hood.
+
 ## Usage
 
 ```
