@@ -57,6 +57,7 @@ impl Harness {
             sessions: std::collections::HashMap::new(),
             id_of: std::collections::HashMap::new(),
             selected,
+            config_node: None,
             next_id: 0,
             ctx: None,
             clipboard: None,
@@ -71,6 +72,7 @@ impl Harness {
             scroll_acc: 0.0,
             cursor: winit::window::CursorIcon::Default,
             win_hover: None,
+            header_hover: false,
         };
         let dir = std::env::temp_dir().join(format!(
             "termem-shots-{}-{}",
@@ -200,7 +202,10 @@ impl Harness {
             .map(|c| if c.is_alphanumeric() { c } else { '-' })
             .collect();
         let path = self.dir.join(format!("{:03}-{safe}.png", self.seq));
-        write_png(&path, w, h, &self.state.fb).expect("write png");
+        // Frame the window in a padded canvas with a soft drop shadow, the way
+        // macOS window screenshots look, instead of a bare edge-to-edge crop.
+        let (cw, ch, canvas) = compose_screenshot(w, h, &self.state.fb);
+        write_png(&path, cw, ch, &canvas).expect("write png");
         println!("Screenshot taken: {}", path.display());
         path
     }
@@ -238,6 +243,68 @@ impl Harness {
 // ===========================================================================
 // Minimal dependency-free PNG writer (8-bit truecolour, zlib *stored* blocks).
 // ===========================================================================
+
+/// Margin (px) of neutral background around the window in a screenshot.
+const SHOT_PAD: usize = 44;
+
+/// Frame a `w`×`h` window framebuffer in a larger canvas with a neutral
+/// background and a soft drop shadow — the look of a macOS window screenshot.
+/// Returns the canvas dimensions and pixels. Pure RGB (the PNG writer has no
+/// alpha), so the "shadow" is the background darkened with distance falloff.
+fn compose_screenshot(w: usize, h: usize, fb: &[u32]) -> (usize, usize, Vec<u32>) {
+    let pad = SHOT_PAD;
+    let (cw, ch) = (w + pad * 2, h + pad * 2);
+    let bg: u32 = 0x00_e9_e9_ec; // soft neutral grey
+    let mut out = vec![bg; cw * ch];
+
+    // Drop shadow: a dark halo around the window, pooled slightly below it.
+    let shadow_off: i32 = 12; // vertical offset (px)
+    let radius: f32 = 30.0; // falloff distance (px)
+    let max_a: f32 = 70.0; // peak shadow strength (~27%)
+    let (rx0, ry0) = (pad as i32, pad as i32 + shadow_off);
+    let (rx1, ry1) = (rx0 + w as i32, ry0 + h as i32);
+    let r = radius.ceil() as i32;
+    for y in (ry0 - r)..(ry1 + r) {
+        if y < 0 || y >= ch as i32 {
+            continue;
+        }
+        for x in (rx0 - r)..(rx1 + r) {
+            if x < 0 || x >= cw as i32 {
+                continue;
+            }
+            // Distance from the (shifted) window rect; 0 inside it.
+            let dx = (rx0 - x).max(x - (rx1 - 1)).max(0) as f32;
+            let dy = (ry0 - y).max(y - (ry1 - 1)).max(0) as f32;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist >= radius {
+                continue;
+            }
+            let t = 1.0 - dist / radius;
+            let a = (t * t * max_a) as u32; // squared = softer edge
+            let idx = (y as usize) * cw + x as usize;
+            out[idx] = blend_rgb(0x00_00_00, out[idx], a);
+        }
+    }
+
+    // Composite the window opaquely on top (covers the shadow under it).
+    for y in 0..h {
+        let dst = (y + pad) * cw + pad;
+        out[dst..dst + w].copy_from_slice(&fb[y * w..y * w + w]);
+    }
+    (cw, ch, out)
+}
+
+/// Straight (non-gamma) alpha blend of `fg` over `bg`, `a` in `0..=255`.
+/// Good enough for the screenshot shadow; the UI itself uses the gamma-correct
+/// blend in `lib.rs`.
+fn blend_rgb(fg: u32, bg: u32, a: u32) -> u32 {
+    let mix = |sh: u32| {
+        let f = (fg >> sh) & 0xff;
+        let b = (bg >> sh) & 0xff;
+        ((f * a + b * (255 - a)) / 255) & 0xff
+    };
+    (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
 
 fn write_png(path: &Path, w: usize, h: usize, fb: &[u32]) -> std::io::Result<()> {
     assert_eq!(fb.len(), w * h, "framebuffer size mismatch");

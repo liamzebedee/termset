@@ -1,4 +1,5 @@
-//! termem — a workspace-organized mini terminal emulator.
+//! manyterm — a workspace-organized mini terminal emulator.
+//! (crate `termset_cli`; binary `terms`.)
 //!
 //! Backend : `alacritty_terminal` (PTY + VT/ANSI state machine + parser thread)
 //! Frontend: `winit` (window + keyboard/mouse) + `softbuffer` (CPU framebuffer)
@@ -31,6 +32,8 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
+
+use serde::{Deserialize, Serialize};
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -82,6 +85,9 @@ struct Node {
     /// Created at runtime (a new scratch tab) rather than from the spec file.
     /// Dynamic leaves are removed from the tree when their session exits.
     dynamic: bool,
+    /// Never serialized to the workspace file — a purely runtime helper tab
+    /// (the background "edit layout" nano session). Recreated each launch.
+    volatile: bool,
 }
 
 /// The workspace. An arena of `Node`s plus the root index. The arena layout is
@@ -102,6 +108,7 @@ impl Tree {
             kind,
             expanded: true,
             dynamic,
+            volatile: false,
         });
         if let Some(p) = parent {
             self.nodes[p].children.push(id);
@@ -155,23 +162,32 @@ impl Tree {
     /// DFS over visible nodes (groups gate their subtree via `expanded`). This
     /// is the catamorphism the sidebar render and hit-testing both fold over,
     /// so the picture on screen and the click map can never disagree.
-    fn rows(&self) -> Vec<Row> {
-        fn go(t: &Tree, id: NodeId, out: &mut Vec<Row>) {
+    ///
+    /// `reveal` is the currently-selected node: a *volatile* node (the pre-warmed
+    /// "Edit Config" session) is hidden from the sidebar unless it equals
+    /// `reveal` — i.e. it only shows while it's the active tab. Pass an invalid
+    /// id (e.g. the root) to hide all volatile nodes.
+    fn rows(&self, reveal: NodeId) -> Vec<Row> {
+        fn go(t: &Tree, id: NodeId, depth: usize, reveal: NodeId, out: &mut Vec<Row>) {
             for &c in &t.nodes[id].children {
                 let n = &t.nodes[c];
+                if n.volatile && c != reveal {
+                    continue; // hidden background tab (e.g. Edit Config)
+                }
                 let is_group = matches!(n.kind, Kind::Group);
                 out.push(Row {
                     id: c,
                     name: n.name.clone(),
                     is_group,
+                    depth,
                 });
                 if is_group && n.expanded {
-                    go(t, c, out);
+                    go(t, c, depth + 1, reveal, out);
                 }
             }
         }
         let mut out = Vec::new();
-        go(self, self.root, &mut out);
+        go(self, self.root, 0, reveal, &mut out);
         out
     }
 
@@ -240,6 +256,9 @@ struct Row {
     id: NodeId,
     name: String,
     is_group: bool,
+    /// Tree depth: `0` for a top-level node (a section, or a standalone
+    /// top-level session like "Edit Config"), `1+` for nested sessions.
+    depth: usize,
 }
 
 /// Expand `~` / `~/...` to `$HOME`. Pure given `home`.
@@ -263,16 +282,44 @@ fn collapse_tilde(p: &Path, home: &Path) -> String {
     }
 }
 
-/// Parse the `workspace` file into a tree.
-///
-/// Format: indentation depth = tree depth (one `\t` per level). Fields on a
-/// line are tab-separated; surrounding whitespace and `"`quotes`"` are
-/// stripped. A line with >1 tab-separated field is a `Leaf` (`name`,
-/// `workdir`, optional `command`); a single bare token is a `Group`. The
-/// first non-empty line (`workspaces`) is the root sentinel. `Scratch` and
-/// `Transient` are ensured present (appended only if the file lacks them) as
-/// homes for ad-hoc sessions. Inverse of [`serialize_workspace`].
+/// The on-disk layout/config schema (YAML). A flat list of named sections, each
+/// holding named sessions. This is the *typed* shape `serde` (de)serializes; the
+/// in-memory [`Tree`] is built from it (and back). Kept deliberately simple —
+/// two levels (section → session), which is all the UI exposes.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct LayoutCfg {
+    /// Top-level sections shown in the sidebar, in order.
+    #[serde(default)]
+    groups: Vec<GroupCfg>,
+}
+
+/// One sidebar section. May be empty (it still shows as a header).
+#[derive(Debug, Serialize, Deserialize)]
+struct GroupCfg {
+    name: String,
+    /// Sessions in this section. Omitted in YAML when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sessions: Vec<SessionCfg>,
+}
+
+/// One session (a leaf): a working directory and an optional default command.
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionCfg {
+    name: String,
+    /// Working directory (`~` allowed). Empty/absent → `$HOME`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    dir: String,
+    /// Default command run by Start. Omitted in YAML when empty (a bare shell).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    command: String,
+}
+
+/// Parse the YAML layout file into a tree. Malformed YAML degrades to an empty
+/// layout rather than panicking. Empty sections are kept (they render as bare
+/// headers). Inverse of [`serialize_workspace`].
 fn parse_workspace(text: &str, home: &Path) -> Tree {
+    let cfg: LayoutCfg = serde_yaml::from_str(text).unwrap_or_default();
+
     let mut tree = Tree {
         nodes: Vec::new(),
         root: 0,
@@ -280,94 +327,60 @@ fn parse_workspace(text: &str, home: &Path) -> Tree {
     let root = tree.push(None, "workspaces".into(), Kind::Root, false);
     tree.root = root;
 
-    // stack[d] = id of the most recent node opened at depth d. A child at
-    // depth d attaches to stack[d-1]; depth 1 attaches to the root.
-    let mut stack: Vec<NodeId> = vec![root];
-
-    for raw in text.lines() {
-        if raw.trim().is_empty() {
-            continue;
-        }
-        let depth = raw.chars().take_while(|&c| c == '\t').count();
-        if depth == 0 {
-            // The `workspaces` root line; already created.
-            continue;
-        }
-        let rest = raw.trim_start_matches('\t');
-        // Split on tabs *before* trimming so an empty trailing command field
-        // (`"name"\tdir\t`) still marks the line as a leaf, not a group.
-        let parts: Vec<&str> = rest.split('\t').collect();
-        let clean = |s: &str| s.trim().trim_matches('"').trim().to_string();
-        let parent = *stack.get(depth - 1).unwrap_or(&root);
-        let id = if parts.len() == 1 {
-            let name = clean(parts[0]);
-            if name.is_empty() {
-                continue;
-            }
-            tree.push(Some(parent), name, Kind::Group, false)
-        } else {
-            let workdir = expand_tilde(&clean(parts[1]), home);
-            let command = parts.get(2).map(|s| clean(s)).unwrap_or_default();
+    for g in cfg.groups {
+        let gid = tree.push(Some(root), g.name, Kind::Group, false);
+        for s in g.sessions {
+            let workdir = if s.dir.trim().is_empty() {
+                home.to_path_buf()
+            } else {
+                expand_tilde(s.dir.trim(), home)
+            };
             tree.push(
-                Some(parent),
-                clean(parts[0]),
-                Kind::Leaf { workdir, command },
+                Some(gid),
+                s.name,
+                Kind::Leaf {
+                    workdir,
+                    command: s.command,
+                },
                 false,
-            )
-        };
-        stack.truncate(depth);
-        stack.push(id);
-    }
-
-    // Ensure the ad-hoc homes exist, but don't duplicate them when a saved
-    // file already carries them (with their persisted scratch sessions).
-    for name in ["Scratch", "Transient"] {
-        let present = tree.nodes[root]
-            .children
-            .iter()
-            .any(|&c| tree.nodes[c].name == name && matches!(tree.nodes[c].kind, Kind::Group));
-        if !present {
-            tree.push(Some(root), name.into(), Kind::Group, false);
+            );
         }
     }
     tree
 }
 
-/// Serialize the tree back to the `workspace` file format. Inverse of
-/// [`parse_workspace`] (round-trips structure, names, workdirs, commands).
-/// Pure; `home` re-collapses absolute workdirs to `~`.
+/// Serialize the tree back to the YAML layout file. Inverse of
+/// [`parse_workspace`] (round-trips sections, sessions, workdirs, commands).
+/// Pure; `home` re-collapses absolute workdirs to `~`. Volatile helper tabs
+/// (e.g. the layout-editing nano session) are omitted. Two levels only — a
+/// section's sub-groups (none exist in practice) would be flattened away.
 fn serialize_workspace(tree: &Tree, home: &Path) -> String {
-    fn go(t: &Tree, id: NodeId, depth: usize, home: &Path, out: &mut String) {
-        for &c in &t.nodes[id].children {
-            let n = &t.nodes[c];
-            let indent = "\t".repeat(depth);
-            match &n.kind {
-                Kind::Group => {
-                    out.push_str(&format!("{indent}{}\n", n.name));
-                    go(t, c, depth + 1, home, out);
-                }
-                Kind::Leaf { workdir, command } => {
-                    let wd = collapse_tilde(workdir, home);
-                    if command.is_empty() {
-                        out.push_str(&format!("{indent}\"{}\"\t{}\n", n.name, wd));
-                    } else {
-                        // Quote a command only when it contains whitespace,
-                        // mirroring the hand-written file's style.
-                        let cmd = if command.split_whitespace().nth(1).is_some() {
-                            format!("\"{command}\"")
-                        } else {
-                            command.clone()
-                        };
-                        out.push_str(&format!("{indent}\"{}\"\t{}\t{}\n", n.name, wd, cmd));
-                    }
-                }
-                Kind::Root => {}
+    let mut cfg = LayoutCfg::default();
+    for &gid in &tree.nodes[tree.root].children {
+        let g = &tree.nodes[gid];
+        if g.volatile || !matches!(g.kind, Kind::Group) {
+            continue;
+        }
+        let mut group = GroupCfg {
+            name: g.name.clone(),
+            sessions: Vec::new(),
+        };
+        for &lid in &g.children {
+            let n = &tree.nodes[lid];
+            if n.volatile {
+                continue; // runtime-only helper tab
+            }
+            if let Kind::Leaf { workdir, command } = &n.kind {
+                group.sessions.push(SessionCfg {
+                    name: n.name.clone(),
+                    dir: collapse_tilde(workdir, home),
+                    command: command.clone(),
+                });
             }
         }
+        cfg.groups.push(group);
     }
-    let mut out = String::from("workspaces\n");
-    go(tree, tree.root, 1, home, &mut out);
-    out
+    serde_yaml::to_string(&cfg).unwrap_or_default()
 }
 
 /// What the shell observed about a session's PTY, gathered from `/proc`.
@@ -525,7 +538,8 @@ enum Shortcut {
     Start,
     Stop,
     ToggleSidebar,
-    OpenConfig,
+    EditLayout,
+    SaveLayout,
     Quit,
 }
 
@@ -535,15 +549,16 @@ enum Shortcut {
 /// * **macOS** uses ⌘ (Command), like every native mac app: ⌘C copy, ⌘V paste,
 ///   ⌘T new tab, ⌘W close, ⌘↑/⌘↓ select previous/next tree node, ⌘←/⌘→
 ///   collapse/expand the selected group, ⌘R run/start, ⌘. stop, ⌘B toggle the
-///   sidebar, ⌘, open the config file, ⌘Q quit. ⌘ never collides with the
-///   shell's own Ctrl- control codes, so all of these are safe to claim.
+///   sidebar, ⌘, edit layout (the layout file in an editor tab), ⌘S save layout,
+///   ⌘Q quit. ⌘ never collides with the shell's own Ctrl- control codes, so all
+///   of these are safe to claim.
 /// * **Elsewhere** there is no ⌘, so the terminal convention Ctrl+Shift is used
 ///   (plain Ctrl+C etc. must stay free for the shell): Ctrl+Shift+C/V/T/W for
 ///   copy/paste/new/close, Ctrl+Shift+↑/↓ select previous/next node,
 ///   Ctrl+Shift+←/→ collapse/expand the selected group, Ctrl+Shift+B toggle the
-///   sidebar, Ctrl+Shift+S start, Ctrl+Shift+X stop, Ctrl+Shift+, open the
-///   config file, Ctrl+Shift+Q quit. (Shift+`,` reports as `<` on many layouts,
-///   so both are accepted.)
+///   sidebar, Ctrl+Shift+R start, Ctrl+Shift+X stop, Ctrl+Shift+, edit layout,
+///   Ctrl+Shift+S save layout, Ctrl+Shift+Q quit. (Shift+`,` reports as `<` on
+///   many layouts, so both are accepted.)
 fn match_shortcut(mods: ModifiersState, key: &Key) -> Option<Shortcut> {
     let ch = |name: &str| matches!(key, Key::Character(c) if c.eq_ignore_ascii_case(name));
     #[cfg(target_os = "macos")]
@@ -565,7 +580,8 @@ fn match_shortcut(mods: ModifiersState, key: &Key) -> Option<Shortcut> {
             Key::Named(NamedKey::ArrowRight) => Shortcut::Expand,
             _ if ch("b") => Shortcut::ToggleSidebar,
             _ if ch("r") => Shortcut::Start,
-            _ if ch(",") => Shortcut::OpenConfig,
+            _ if ch("s") => Shortcut::SaveLayout,
+            _ if ch(",") => Shortcut::EditLayout,
             _ if ch("q") => Shortcut::Quit,
             _ => return None,
         })
@@ -585,10 +601,11 @@ fn match_shortcut(mods: ModifiersState, key: &Key) -> Option<Shortcut> {
             Key::Named(NamedKey::ArrowLeft) => Shortcut::Collapse,
             Key::Named(NamedKey::ArrowRight) => Shortcut::Expand,
             _ if ch("b") => Shortcut::ToggleSidebar,
-            _ if ch("s") => Shortcut::Start,
+            _ if ch("r") => Shortcut::Start,
+            _ if ch("s") => Shortcut::SaveLayout,
             _ if ch("x") => Shortcut::Stop,
             // Shift+`,` is `<` on most layouts; accept either.
-            _ if ch(",") || ch("<") => Shortcut::OpenConfig,
+            _ if ch(",") || ch("<") => Shortcut::EditLayout,
             _ if ch("q") => Shortcut::Quit,
             _ => return None,
         })
@@ -758,6 +775,8 @@ enum UserEvent {
     /// Glyph-coverage fonts (emoji + OS CJK/symbol faces) finished loading on a
     /// worker thread — swap them into the renderer so later frames cover more.
     FallbackFonts(Vec<fontdue::Font>),
+    /// TEMP DEBUG: force a window resize to (w,h) physical px.
+    TestResize(u32, u32),
 }
 
 /// `EventListener` impl handed to `alacritty_terminal`. Forwards the events we
@@ -1060,7 +1079,8 @@ const RPANEL_W: usize = 252; // right inspector pane width
 const WBTN_W: usize = 30; // minimum sidebar width (also the old info-button width)
 const TLIGHT_CELL: usize = 18; // per-dot hit cell for the window controls
 const TLIGHT_R: f32 = 5.0; // traffic-light dot radius (px); diameter 10 in a 16px row
-const EDGE: f64 = 5.0; // borderless-window resize-grip thickness
+const EDGE: f64 = 9.0; // borderless-window resize-grip thickness (edges)
+const CORNER: f64 = 22.0; // larger square grab zone at each window corner
 
 // macOS-style "traffic light" window controls (bitmap dots, not glyphs).
 const TLIGHT_MIN: u32 = 0xfe_bc_2e; // minimize — amber
@@ -1332,10 +1352,29 @@ struct Session {
 // ===========================================================================
 
 /// State of an open right-click menu: where it was opened and on which node.
+/// What a right-click context menu offers. Both kinds have exactly two items.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CtxKind {
+    /// On a sidebar session/section: Start / Stop.
+    Session,
+    /// In the terminal area: Copy / Paste.
+    Edit,
+}
+
+impl CtxKind {
+    fn items(self) -> [&'static str; 2] {
+        match self {
+            CtxKind::Session => ["Start", "Stop"],
+            CtxKind::Edit => ["Copy", "Paste"],
+        }
+    }
+}
+
 struct CtxMenu {
     x: usize,
     y: usize,
     node: NodeId,
+    kind: CtxKind,
 }
 
 /// Everything that exists once the window is created — or, headlessly, once
@@ -1362,6 +1401,10 @@ struct State {
     /// PTY event id -> owning leaf node, for routing parser-thread events.
     id_of: HashMap<u64, NodeId>,
     selected: NodeId,
+    /// The single background "edit layout" tab (a volatile leaf running nano on
+    /// the config). Pre-warmed at startup and reused by ⌘, / Ctrl+Shift+, so
+    /// there is only ever one; recreated after it auto-closes (nano quit / ⌘W).
+    config_node: Option<NodeId>,
     next_id: u64,
     ctx: Option<CtxMenu>,
     clipboard: Option<arboard::Clipboard>,
@@ -1390,6 +1433,9 @@ struct State {
     /// (`0`=minimize, `1`=maximize, `2`=close), or `None`. Drives the hover
     /// state that reveals the dots' glyphs, like macOS.
     win_hover: Option<usize>,
+    /// Whether the pointer is over the title bar (top `HEADER_H` strip), which
+    /// gets a slight highlight so it reads as the draggable region.
+    header_hover: bool,
 }
 
 impl State {
@@ -1516,8 +1562,8 @@ impl State {
         }
 
         // --- sidebar tree ---------------------------------------------------
-        let rows = self.tree.rows();
         let sel = self.selected;
+        let rows = self.tree.rows(sel);
         if sw > 0 {
             draw_sidebar(
                 &mut buf,
@@ -1528,6 +1574,20 @@ impl State {
                 sel,
                 sw,
             );
+        }
+
+        // --- title-bar hover highlight -------------------------------------
+        // A faint lightening across the whole top strip while the pointer is
+        // over it, hinting that it's the draggable region. Skips the 1px bevel
+        // lines so they stay crisp.
+        if self.header_hover && HEADER_H > 2 {
+            for y in 1..HEADER_H - 1 {
+                let row = y * pw;
+                for x in 0..pw {
+                    let i = row + x;
+                    buf[i] = blend(0xff_ff_ff, buf[i], 20);
+                }
+            }
         }
 
         // --- right inspector ------------------------------------------------
@@ -1548,7 +1608,8 @@ impl State {
 
         // --- context menu ---------------------------------------------------
         if let Some(m) = &self.ctx {
-            draw_ctx_menu(&mut buf, pw, ph, &mut self.renderer, m.x, m.y);
+            let hov = ctx_item_at(m, self.mouse.0, self.mouse.1);
+            draw_ctx_menu(&mut buf, pw, ph, &mut self.renderer, m.x, m.y, m.kind.items(), hov);
         }
 
         self.fb = buf;
@@ -1619,20 +1680,32 @@ impl State {
 
     /// Logical width of the sidebar pane: `0` when hidden, otherwise the left
     /// label inset plus the longest label plus a fixed right margin (never
-    /// narrower than the header info button). All chrome geometry and
-    /// hit-testing derive from this, so the pane grows and shrinks to fit its
-    /// content and vanishes when toggled off.
+    /// narrower than `WBTN_W`). All chrome geometry and hit-testing derive from
+    /// this, so the pane grows and shrinks to fit its content and vanishes when
+    /// toggled off.
+    ///
+    /// The width fits the longest label across *every* node — all groups and
+    /// leaves, whether or not their parent is currently expanded — so the pane
+    /// stays a fixed width as groups fold and unfold. Walks reachable nodes
+    /// only, skipping orphaned (closed) leaves still parked in the arena.
     fn sidebar_w(&self) -> usize {
         if !self.sidebar_visible {
             return 0;
         }
-        let label_px = self
-            .tree
-            .rows()
-            .iter()
-            .map(|row| row.name.chars().count() * self.renderer.cell_w)
-            .max()
-            .unwrap_or(0);
+        fn widest(t: &Tree, id: NodeId, acc: &mut usize) {
+            for &c in &t.nodes[id].children {
+                // Volatile tabs (the hidden "Edit Config" session) must not
+                // affect the width, so it stays put as that tab comes and goes.
+                if t.nodes[c].volatile {
+                    continue;
+                }
+                *acc = (*acc).max(t.nodes[c].name.chars().count());
+                widest(t, c, acc);
+            }
+        }
+        let mut chars = 0;
+        widest(&self.tree, self.tree.root, &mut chars);
+        let label_px = chars * self.renderer.cell_w;
         (SIDEBAR_PAD_L + label_px).max(WBTN_W) + SIDEBAR_MARGIN
     }
 
@@ -1866,37 +1939,68 @@ impl App {
         }
     }
 
-    /// Open the workspace/config file in a new scratch tab, editing it in
-    /// `nano`. The terminal equivalent of an editor's ⌘, — there is no separate
-    /// settings UI, the workspace file *is* the config. The tab is a normal
-    /// dynamic leaf, so ⌘W closes it.
-    fn open_config(&mut self) {
+    /// Ensure the single "Edit Config" session exists with nano open on the
+    /// config file, returning its node. A singleton: if it's already live it is
+    /// reused (so ⌘, never opens a second, conflicting editor); otherwise it is
+    /// (re)created. It is a standalone *top-level* session (a volatile leaf
+    /// directly under the root, titled "Edit Config" — its own separated block
+    /// in the sidebar, not inside any section, never written back into the
+    /// layout). It runs nano via `exec`, so quitting nano ends the PTY and the
+    /// dynamic session auto-closes — after which the next call recreates it.
+    /// Pre-warmed at startup, but hidden from the sidebar until it is the active
+    /// (selected) tab (see `Tree::rows`), so it stays ready without cluttering.
+    fn ensure_config_node(&mut self) -> Option<NodeId> {
+        // Reuse the existing session while it is still live.
+        if let Some(st) = self.state.as_ref() {
+            if let Some(id) = st.config_node {
+                if st.sessions.contains_key(&id) {
+                    return Some(id);
+                }
+            }
+        }
         let path = self.ws_path.clone();
         let dir = path
             .parent()
+            .filter(|p| !p.as_os_str().is_empty())
             .map(Path::to_path_buf)
-            .unwrap_or_else(home_dir);
-        let command = format!("nano {}", shell_quote(&path));
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| home_dir()));
+        // `exec` replaces the shell with nano, so quitting nano ends the PTY →
+        // the dynamic session auto-closes (see the `UserEvent::Exit` handler).
+        let command = format!("exec nano {}", shell_quote(&path));
         let node = {
-            let Some(st) = self.state.as_mut() else { return };
-            let group = st.tree.group_for_new(st.selected);
-            let node = st.tree.push(
-                Some(group),
-                "config".to_string(),
+            let Some(st) = self.state.as_mut() else { return None };
+            let root = st.tree.root;
+            let id = st.tree.push(
+                Some(root),
+                "Edit Config".to_string(),
                 Kind::Leaf {
                     workdir: dir,
                     command,
                 },
                 true,
             );
-            st.tree.nodes[group].expanded = true;
-            st.selected = node;
-            node
+            st.tree.nodes[id].volatile = true;
+            st.config_node = Some(id);
+            id
         };
-        // Spawn the shell and run the editor in it (the planner does both).
+        // Spawn the shell and exec nano in it (the planner does both).
         self.start(node);
-        self.save_workspace();
-        if let Some(st) = &self.state {
+        Some(node)
+    }
+
+    /// Switch to the background layout-editing tab — nano on the config file —
+    /// creating it if needed. The terminal equivalent of an editor's ⌘,: there
+    /// is no separate settings UI, the YAML file *is* the layout. Edits load on
+    /// the next launch (the running app does not live-apply them); `Ctrl+Shift+S`
+    /// / ⌘S is the inverse (in-memory layout → file).
+    fn edit_layout(&mut self) {
+        let Some(node) = self.ensure_config_node() else { return };
+        if let Some(st) = self.state.as_mut() {
+            if let Some(p) = st.tree.nodes[node].parent {
+                st.tree.nodes[p].expanded = true; // reveal it in the sidebar
+            }
+            st.selected = node;
+            st.focus = None;
             st.request_redraw();
         }
     }
@@ -1936,7 +2040,7 @@ impl App {
     /// collapsed) snaps back to the first row.
     fn select_relative(&mut self, delta: i32) {
         let Some(st) = self.state.as_mut() else { return };
-        let rows = st.tree.rows();
+        let rows = st.tree.rows(st.selected);
         if rows.is_empty() {
             return;
         }
@@ -2599,10 +2703,11 @@ fn draw_sidebar(
             // is inset, so the highlight stays edge-to-edge.
             fill_rect(buf, pw, ph, 0, y, sidebar_w - 1, rh, SEL);
         }
-        // No markers: hierarchy reads from colour alone — groups full-ink,
-        // leaves dim. Labels carry a small left inset (`SIDEBAR_PAD_L`) so the
+        // No markers: hierarchy reads from colour alone — top-level rows
+        // (sections, and the standalone "Edit Config" session) full-ink, nested
+        // sessions dim. Labels carry a small left inset (`SIDEBAR_PAD_L`) so the
         // text doesn't sit flush against the pane edge.
-        let color = if is_sel || row.is_group { INK } else { INK_DIM };
+        let color = if is_sel || row.depth == 0 { INK } else { INK_DIM };
         draw_text(
             buf,
             pw,
@@ -2618,15 +2723,16 @@ fn draw_sidebar(
 }
 
 /// Top y of each sidebar row, relative to `HEADER_H`. A one-row blank spacer
-/// precedes every group except the first row, so groups read as separated
-/// blocks. Shared by [`draw_sidebar`] and `sidebar_hit` so the picture on screen
-/// and the click map can never disagree.
+/// precedes every top-level row except the first, so sections (and the
+/// standalone "Edit Config" session) read as separated blocks. Shared by
+/// [`draw_sidebar`] and `sidebar_hit` so the picture on screen and the click map
+/// can never disagree.
 fn sidebar_row_tops(rows: &[Row], rh: usize) -> Vec<usize> {
     let mut tops = Vec::with_capacity(rows.len());
     let mut y = 0;
     for (i, row) in rows.iter().enumerate() {
-        if i > 0 && row.is_group {
-            y += rh; // blank line between group blocks
+        if i > 0 && row.depth == 0 {
+            y += rh; // blank line between top-level blocks
         }
         tops.push(y);
         y += rh;
@@ -2634,17 +2740,34 @@ fn sidebar_row_tops(rows: &[Row], rh: usize) -> Vec<usize> {
     tops
 }
 
-/// A small bevelled Start/Stop popup at the cursor.
-fn draw_ctx_menu(buf: &mut [u32], pw: usize, ph: usize, r: &mut Renderer, x: usize, y: usize) {
+/// A small bevelled two-item popup at the cursor (Start/Stop or Copy/Paste).
+/// `hovered` is the item the pointer is currently over (`Some(0|1)`), drawn with
+/// a highlight bar so the menu behaves like a normal hover/click menu.
+fn draw_ctx_menu(
+    buf: &mut [u32],
+    pw: usize,
+    ph: usize,
+    r: &mut Renderer,
+    x: usize,
+    y: usize,
+    items: [&str; 2],
+    hovered: Option<usize>,
+) {
     let h = ROW_H * 2 + 2;
     vgradient(buf, pw, ph, x, y, CTX_W, h, PANEL_HI, PANEL_LO);
     stroke_rect(buf, pw, ph, x, y, CTX_W, h, BEVEL_DK);
     fill_rect(buf, pw, ph, x, y, CTX_W, 1, BEVEL_LT);
     fill_rect(buf, pw, ph, x, y, 1, h, BEVEL_LT);
     let ty = ROW_H.saturating_sub(r.cell_h) / 2;
-    draw_text(buf, pw, ph, r, x + 10, y + 1 + ty, CTX_W, "Start", INK);
+    for (i, label) in items.iter().enumerate() {
+        let ry = y + 1 + i * ROW_H;
+        if hovered == Some(i) {
+            fill_rect(buf, pw, ph, x + 1, ry, CTX_W - 2, ROW_H, SEL);
+        }
+        draw_text(buf, pw, ph, r, x + 10, ry + ty, CTX_W - 12, label, INK);
+    }
+    // Divider between the two items (drawn after, so the hover bar sits under it).
     fill_rect(buf, pw, ph, x + 4, y + ROW_H, CTX_W - 8, 1, BEVEL_DK);
-    draw_text(buf, pw, ph, r, x + 10, y + ROW_H + 1 + ty, CTX_W, "Stop", INK);
 }
 
 /// Which context-menu item (if any) the point falls on. `0` = Start, `1` =
@@ -2858,21 +2981,23 @@ fn usecwd_btn(pw: usize, cell_h: usize) -> Rect {
     (x, y + h + 8, w, h)
 }
 
-/// Which resize grip (if any) the point is in, for a borderless window.
+/// Which resize grip (if any) the point is in, for a borderless window. Side and
+/// bottom edges are a thin `EDGE` strip; the two *bottom* corners use a much
+/// larger `CORNER` square so the diagonal grips are easy to hit. The **top has
+/// no resize at all** — it's the title bar (drag + window controls), so there's
+/// no North / NorthWest / NorthEast grip to fight dragging.
 fn resize_dir(pw: usize, ph: usize, x: f64, y: f64) -> Option<ResizeDirection> {
-    let l = x < EDGE;
-    let r = x >= pw as f64 - EDGE;
-    let t = y < EDGE;
-    let b = y >= ph as f64 - EDGE;
-    Some(match (t, b, l, r) {
-        (true, _, true, _) => ResizeDirection::NorthWest,
-        (true, _, _, true) => ResizeDirection::NorthEast,
-        (_, true, true, _) => ResizeDirection::SouthWest,
-        (_, true, _, true) => ResizeDirection::SouthEast,
-        (true, ..) => ResizeDirection::North,
-        (_, true, ..) => ResizeDirection::South,
-        (_, _, true, _) => ResizeDirection::West,
-        (_, _, _, true) => ResizeDirection::East,
+    let (w, h) = (pw as f64, ph as f64);
+    let (l, r, b) = (x < EDGE, x >= w - EDGE, y >= h - EDGE);
+    // Enlarged squares at the two bottom corners only.
+    let (cl, cr) = (x < CORNER, x >= w - CORNER);
+    let cb = y >= h - CORNER;
+    Some(match () {
+        _ if cb && cl => ResizeDirection::SouthWest,
+        _ if cb && cr => ResizeDirection::SouthEast,
+        _ if b => ResizeDirection::South,
+        _ if l => ResizeDirection::West,
+        _ if r => ResizeDirection::East,
         _ => return None,
     })
 }
@@ -2948,14 +3073,23 @@ fn shell_quote(p: &Path) -> String {
     format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"))
 }
 
-/// Which workspace file to use: the first CLI argument if given (a leading
-/// `~` is expanded), else the default `~/.termspace/workspace01`. A
-/// missing/blank argument falls back to the default. If the file doesn't
-/// exist the app just opens a blank workspace and creates it on first save.
+/// Which layout file to use, per the `terms` CLI:
+///
+/// * `terms <file>` → that file (a leading `~` is expanded; relative paths resolve
+///   against the current directory). Opened if it exists, otherwise created on
+///   first save.
+/// * `terms` (no argument) → the per-directory layout file `./termset.yml` in the
+///   current directory — so each project gets its own layout.
+///
+/// Either way, a missing file just opens the default layout (a `Project` group
+/// with one session in the current directory; see [`default_workspace_text`])
+/// and writes it on first save.
 fn resolve_workspace_path() -> PathBuf {
     match std::env::args().nth(1) {
         Some(a) if !a.trim().is_empty() => expand_tilde(a.trim(), &home_dir()),
-        _ => home_dir().join(".termspace").join("workspace01"),
+        _ => std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("termset.yml"),
     }
 }
 
@@ -2968,11 +3102,19 @@ fn default_workspace_text() -> String {
     let name = cwd
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("session");
-    format!(
-        "workspaces\n\tProject\n\t\t\"{name}\"\t{}\n",
-        cwd.display()
-    )
+        .unwrap_or("session")
+        .to_string();
+    let cfg = LayoutCfg {
+        groups: vec![GroupCfg {
+            name: "Project".to_string(),
+            sessions: vec![SessionCfg {
+                name,
+                dir: cwd.display().to_string(),
+                command: String::new(),
+            }],
+        }],
+    };
+    serde_yaml::to_string(&cfg).unwrap_or_default()
 }
 
 /// Tell X11/the compositor the window is fully opaque and clear its backing to
@@ -3000,11 +3142,12 @@ fn mark_window_opaque(window: &Window) {
     let Ok((conn, _screen)) = x11rb::connect(None) else {
         return;
     };
-    // New/exposed regions clear to black instead of leaving stale/transparent
-    // pixels for the compositor to show.
+    // New/exposed regions (e.g. while growing the window during a resize drag)
+    // clear to the theme background rather than black, so the edge being dragged
+    // doesn't flash a dark band before our next frame lands.
     let _ = conn.change_window_attributes(
         xid,
-        &ChangeWindowAttributesAux::new().background_pixel(0),
+        &ChangeWindowAttributesAux::new().background_pixel(BG),
     );
     // `_NET_WM_OPAQUE_REGION = whole window` → the compositor won't alpha-blend
     // the surface against the desktop, even before we've drawn into it.
@@ -3044,18 +3187,18 @@ impl ApplicationHandler<UserEvent> for App {
         // before our first frame lands; `redraw` reveals it after the first
         // `present()`.
         let mut attrs = Window::default_attributes()
-            .with_title("termem")
+            .with_title("termset")
             .with_decorations(false)
             .with_visible(false);
         // Pin a stable WM class / Wayland app_id so the desktop entry's
-        // `StartupWMClass=termem` binds the launcher icon to this window
+        // `StartupWMClass=termset` binds the launcher icon to this window
         // (see scripts/install-icon.sh).
         #[cfg(target_os = "linux")]
         {
             use winit::platform::wayland::WindowAttributesExtWayland;
             use winit::platform::x11::WindowAttributesExtX11;
-            attrs = WindowAttributesExtX11::with_name(attrs, "termem", "termem");
-            attrs = WindowAttributesExtWayland::with_name(attrs, "termem", "termem");
+            attrs = WindowAttributesExtX11::with_name(attrs, "termset", "termset");
+            attrs = WindowAttributesExtWayland::with_name(attrs, "termset", "termset");
         }
         let window = Rc::new(
             event_loop.create_window(attrs).expect("create window"),
@@ -3097,6 +3240,7 @@ impl ApplicationHandler<UserEvent> for App {
             tree,
             sessions: HashMap::new(),
             id_of: HashMap::new(),
+            config_node: None,
             next_id: 0,
             ctx: None,
             clipboard: arboard::Clipboard::new().ok(),
@@ -3111,6 +3255,7 @@ impl ApplicationHandler<UserEvent> for App {
             scroll_acc: 0.0,
             cursor: CursorIcon::Default,
             win_hover: None,
+            header_hover: false,
         };
         self.state = Some(st);
 
@@ -3133,6 +3278,7 @@ impl ApplicationHandler<UserEvent> for App {
         let st = self.state.as_mut().unwrap();
         let (lw, lh) = st.logical_size();
         let size = st.grid_size(lw, lh);
+        eprintln!("DBG spawn-time: phys={:?} logical=({lw},{lh}) grid=({},{}) cell=({},{})", st.phys, size.cols, size.lines, st.renderer.cell_w, st.renderer.cell_h);
 
         // On open: an idle PTY per spec leaf — cwd set, no command run.
         let leaves = st.tree.leaves(st.tree.root);
@@ -3158,6 +3304,24 @@ impl ApplicationHandler<UserEvent> for App {
             st.sessions.insert(node, Session { tab, shell_pid: pid });
         }
         st.request_redraw();
+
+        // Pre-warm the "Edit Config" session (nano on the config) in the
+        // background. It's hidden from the sidebar until it's the active tab
+        // (see `Tree::rows`), so ⌘, / Ctrl+Shift+, reveals an already-open nano.
+        self.ensure_config_node();
+
+        // TEMP DEBUG: simulate a WM resize after the prompt is drawn.
+        if let Ok(spec) = std::env::var("TV_RESIZE") {
+            if let Some((w, h)) = spec.split_once('x') {
+                if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
+                    let proxy = self.proxy.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(1300));
+                        let _ = proxy.send_event(UserEvent::TestResize(w, h));
+                    });
+                }
+            }
+        }
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -3227,6 +3391,14 @@ impl ApplicationHandler<UserEvent> for App {
                     st.request_redraw();
                 }
             }
+            UserEvent::TestResize(w, h) => {
+                if let Some(st) = self.state.as_ref() {
+                    if let Some(win) = &st.window {
+                        eprintln!("DBG TestResize -> request {w}x{h}");
+                        let _ = win.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+                    }
+                }
+            }
         }
     }
 
@@ -3238,7 +3410,8 @@ impl ApplicationHandler<UserEvent> for App {
             // OS runs its own modal loop, so a queued `request_redraw` isn't
             // serviced until the drag ends — leaving a frozen, stretched frame.
             // Drawing here makes the content track the window edge live instead.
-            WindowEvent::Resized(_) => {
+            WindowEvent::Resized(sz) => {
+                eprintln!("DBG Resized: {:?}", sz);
                 self.relayout();
                 self.redraw();
             }
@@ -3280,6 +3453,20 @@ impl ApplicationHandler<UserEvent> for App {
                         st.win_hover = hover;
                         st.request_redraw();
                     }
+                    // Title-bar hover highlight (the draggable top strip).
+                    let over_header = st.mouse.1 >= 0.0
+                        && st.mouse.1 < HEADER_H as f64
+                        && st.mouse.0 >= 0.0
+                        && (st.mouse.0 as usize) < pw;
+                    if over_header != st.header_hover {
+                        st.header_hover = over_header;
+                        st.request_redraw();
+                    }
+                    // Repaint while a context menu is open so its hover bar
+                    // tracks the pointer.
+                    if st.ctx.is_some() {
+                        st.request_redraw();
+                    }
                     if st.selecting {
                         if let Some(node) = st.shown() {
                             let size = st.sessions[&node].tab.size;
@@ -3304,11 +3491,13 @@ impl ApplicationHandler<UserEvent> for App {
                         // 1. A click anywhere resolves an open context menu.
                         if let Some(m) = &self.state.as_ref().unwrap().ctx {
                             let pick = ctx_item_at(m, mx, my);
-                            let node = m.node;
+                            let (node, kind) = (m.node, m.kind);
                             self.state.as_mut().unwrap().ctx = None;
-                            match pick {
-                                Some(0) => self.start(node),
-                                Some(1) => self.stop(node),
+                            match (kind, pick) {
+                                (CtxKind::Session, Some(0)) => self.start(node),
+                                (CtxKind::Session, Some(1)) => self.stop(node),
+                                (CtxKind::Edit, Some(0)) => self.copy_to_clipboard(),
+                                (CtxKind::Edit, Some(1)) => self.paste(),
                                 _ => {}
                             }
                             if let Some(st) = &self.state {
@@ -3385,7 +3574,8 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         // 6. Sidebar: a click selects the row; a group click
                         // also folds/unfolds it (there is no separate expander).
-                        let rows = self.state.as_ref().unwrap().tree.rows();
+                        let sel = self.state.as_ref().unwrap().selected;
+                        let rows = self.state.as_ref().unwrap().tree.rows(sel);
                         if let Some((node, is_group)) =
                             self.state.as_ref().unwrap().sidebar_hit(mx, my, &rows)
                         {
@@ -3438,11 +3628,16 @@ impl ApplicationHandler<UserEvent> for App {
                         self.copy_to_clipboard();
                     }
                     (MouseButton::Right, ElementState::Pressed) => {
-                        let rows = self.state.as_ref().unwrap().tree.rows();
+                        let sel = self.state.as_ref().unwrap().selected;
+                        let rows = self.state.as_ref().unwrap().tree.rows(sel);
+                        let (pw, _) = self.state.as_ref().unwrap().logical_size();
                         let sw = self.state.as_ref().unwrap().sidebar_w();
+                        let inspector = self.state.as_ref().unwrap().inspector;
+                        let tr = term_right(pw, inspector);
                         if let Some((node, _)) =
                             self.state.as_ref().unwrap().sidebar_hit(mx, my, &rows)
                         {
+                            // Sidebar: Start / Stop for the right-clicked node.
                             let st = self.state.as_mut().unwrap();
                             st.selected = node;
                             st.focus = None;
@@ -3450,6 +3645,18 @@ impl ApplicationHandler<UserEvent> for App {
                                 x: (mx as usize).min(sw),
                                 y: my as usize,
                                 node,
+                                kind: CtxKind::Session,
+                            });
+                            st.request_redraw();
+                        } else if mx >= sw as f64 && (mx as usize) < tr && my >= HEADER_H as f64 {
+                            // Terminal area: Copy / Paste.
+                            let st = self.state.as_mut().unwrap();
+                            let node = st.selected;
+                            st.ctx = Some(CtxMenu {
+                                x: (mx as usize).min(pw.saturating_sub(CTX_W)),
+                                y: my as usize,
+                                node,
+                                kind: CtxKind::Edit,
                             });
                             st.request_redraw();
                         } else if let Some(st) = self.state.as_mut() {
@@ -3513,7 +3720,13 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                         Shortcut::ToggleSidebar => self.toggle_sidebar(),
-                        Shortcut::OpenConfig => self.open_config(),
+                        Shortcut::EditLayout => self.edit_layout(),
+                        Shortcut::SaveLayout => {
+                            self.save_workspace();
+                            if let Some(st) = &self.state {
+                                st.request_redraw();
+                            }
+                        }
                         Shortcut::Quit => event_loop.exit(),
                     }
                     return;
@@ -3627,25 +3840,50 @@ pub fn run() {
 mod tests {
     use super::*;
 
-    // A fixed fixture in the original hand-written style. Tests must not
-    // depend on the live `workspace` file — the app rewrites it (persisted
-    // sessions, edits), so coupling tests to it makes them flaky.
-    const FIXTURE: &str = "workspaces
-\tApps
-\t\t\"qwen\"\t/home/liam/.apps\t./run-llama.sh
-\tMusic
-\t\t\"Hermes chat\"\t~/Music\thermes
-\t\t\"Wanted music\"\t~/Music\t\"nano wanted\"
-\tDiabetes
-\t\t\"Meal planner\"\t~/Documents/projects/diabetes/mealplanner\t \"bun run main.ts\"
-\t\t\"Sugar tracker\"\t/home/liam/Documents/projects/diabetes/sugar\t./run.sh
-\tMorphology
-\t\t\"morpheus\"\t~/Documents/projects/morpheus\tbash
-\tHTGAA
-\t\t\"website\"\t/home/liam/Documents/projects/webpages\tbash
-\tStudy
-\t\t\"Papers\"\t~/Documents/papers\tbash
-\t\t\"Podcasts\"\t/home/liam/Dropbox/podcast-learn\tbash
+    // A fixed fixture in the YAML layout format. Tests must not depend on the
+    // live layout file — the app rewrites it (persisted sessions, edits), so
+    // coupling tests to it makes them flaky.
+    const FIXTURE: &str = "\
+groups:
+  - name: Apps
+    sessions:
+      - name: qwen
+        dir: /home/liam/.apps
+        command: ./run-llama.sh
+  - name: Music
+    sessions:
+      - name: Hermes chat
+        dir: ~/Music
+        command: hermes
+      - name: Wanted music
+        dir: ~/Music
+        command: nano wanted
+  - name: Diabetes
+    sessions:
+      - name: Meal planner
+        dir: ~/Documents/projects/diabetes/mealplanner
+        command: bun run main.ts
+      - name: Sugar tracker
+        dir: /home/liam/Documents/projects/diabetes/sugar
+        command: ./run.sh
+  - name: Morphology
+    sessions:
+      - name: morpheus
+        dir: ~/Documents/projects/morpheus
+        command: bash
+  - name: HTGAA
+    sessions:
+      - name: website
+        dir: /home/liam/Documents/projects/webpages
+        command: bash
+  - name: Study
+    sessions:
+      - name: Papers
+        dir: ~/Documents/papers
+        command: bash
+      - name: Podcasts
+        dir: /home/liam/Dropbox/podcast-learn
+        command: bash
 ";
 
     fn tree() -> Tree {
@@ -3660,9 +3898,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_groups_leaves_and_synthetic_areas() {
+    fn parses_groups_and_leaves() {
         let t = tree();
-        // Root child groups, in file order, then the two synthetic ones.
+        // Root child groups, in file order. Nothing is synthesized any more.
         let groups: Vec<&str> = t.nodes[t.root]
             .children
             .iter()
@@ -3670,20 +3908,8 @@ mod tests {
             .collect();
         assert_eq!(
             groups,
-            [
-                "Apps",
-                "Music",
-                "Diabetes",
-                "Morphology",
-                "HTGAA",
-                "Study",
-                "Scratch",
-                "Transient",
-            ]
+            ["Apps", "Music", "Diabetes", "Morphology", "HTGAA", "Study"]
         );
-        // Scratch / Transient are empty groups (homes for ad-hoc tabs).
-        assert!(t.leaves(group(&t, "Scratch")).is_empty());
-        assert!(t.leaves(group(&t, "Transient")).is_empty());
     }
 
     #[test]
@@ -3859,19 +4085,8 @@ mod tests {
         let t1 = parse_workspace(FIXTURE, home);
         let text = serialize_workspace(&t1, home);
         let t2 = parse_workspace(&text, home);
-        // Re-parsing the serialized form yields the same tree...
+        // Re-parsing the serialized YAML yields the same tree.
         assert_eq!(shape(&t1, home), shape(&t2, home));
-        // ...and the synthetic homes are present exactly once (not doubled
-        // by the round trip).
-        let count = |t: &Tree, name: &str| {
-            t.nodes[t.root]
-                .children
-                .iter()
-                .filter(|&&c| t.nodes[c].name == name)
-                .count()
-        };
-        assert_eq!(count(&t2, "Scratch"), 1);
-        assert_eq!(count(&t2, "Transient"), 1);
     }
 
     #[test]
@@ -3879,7 +4094,7 @@ mod tests {
         // A new scratch tab has an empty command; it must come back as a
         // leaf (with its cwd), not get misread as a group.
         let home = Path::new("/home/u");
-        let mut t = parse_workspace("workspaces\n\tScratch\n", home);
+        let mut t = parse_workspace("groups:\n  - name: Scratch\n", home);
         let scratch = group(&t, "Scratch");
         t.push(
             Some(scratch),
@@ -3901,18 +4116,16 @@ mod tests {
     }
 
     #[test]
-    fn new_workspace_has_project_session_in_cwd_plus_scratch() {
-        // A brand-new (missing/empty) workspace opens with a `Project` group
-        // holding one session whose workdir is the current directory, plus
-        // the Scratch/Transient areas.
+    fn new_workspace_has_project_session_in_cwd() {
+        // A brand-new (missing/empty) workspace opens with a single `Project`
+        // group holding one session whose workdir is the current directory.
         let t = parse_workspace(&default_workspace_text(), Path::new("/home/u"));
-        let is_group = |name| {
-            t.nodes
-                .iter()
-                .any(|n| n.name == name && matches!(n.kind, Kind::Group))
-        };
-        assert!(is_group("Project"));
-        assert!(is_group("Scratch") && is_group("Transient"));
+        let groups: Vec<&str> = t.nodes[t.root]
+            .children
+            .iter()
+            .map(|&c| t.nodes[c].name.as_str())
+            .collect();
+        assert_eq!(groups, ["Project"]);
 
         let project = group(&t, "Project");
         let leaves = t.leaves(project);
@@ -3941,6 +4154,7 @@ mod tests {
     fn shortcuts_map_per_platform() {
         let c = Key::Character("c".into());
         let dot = Key::Character(".".into());
+        let s = Key::Character("s".into());
         let q = Key::Character("q".into());
         let comma = Key::Character(",".into());
         let lt = Key::Character("<".into()); // Shift+`,` on most layouts
@@ -3955,16 +4169,18 @@ mod tests {
             // ⌘ is the mac modifier; Ctrl+Shift is not.
             assert_eq!(match_shortcut(cmd, &c), Some(Shortcut::Copy));
             assert_eq!(match_shortcut(cmd, &dot), Some(Shortcut::Stop));
+            assert_eq!(match_shortcut(cmd, &s), Some(Shortcut::SaveLayout));
+            assert_eq!(match_shortcut(cmd, &comma), Some(Shortcut::EditLayout));
             assert_eq!(match_shortcut(cmd, &q), Some(Shortcut::Quit));
-            assert_eq!(match_shortcut(cmd, &comma), Some(Shortcut::OpenConfig));
             assert_eq!(match_shortcut(ctrl_shift, &c), None);
         } else {
             // Ctrl+Shift is the modifier elsewhere; ⌘ doesn't exist.
             assert_eq!(match_shortcut(ctrl_shift, &c), Some(Shortcut::Copy));
+            assert_eq!(match_shortcut(ctrl_shift, &s), Some(Shortcut::SaveLayout));
             assert_eq!(match_shortcut(ctrl_shift, &q), Some(Shortcut::Quit));
-            // Both `,` and its shifted `<` open the config.
-            assert_eq!(match_shortcut(ctrl_shift, &comma), Some(Shortcut::OpenConfig));
-            assert_eq!(match_shortcut(ctrl_shift, &lt), Some(Shortcut::OpenConfig));
+            // Both `,` and its shifted `<` edit the layout.
+            assert_eq!(match_shortcut(ctrl_shift, &comma), Some(Shortcut::EditLayout));
+            assert_eq!(match_shortcut(ctrl_shift, &lt), Some(Shortcut::EditLayout));
             assert_eq!(match_shortcut(cmd, &c), None);
         }
     }

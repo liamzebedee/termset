@@ -1,0 +1,55 @@
+groups:
+- name: Apps
+  sessions:
+  - name: qwen
+    dir: ~/.apps
+    command: ./run-llama.sh
+  - name: Apps 2
+    dir: ~/.apps
+- name: Music
+  sessions:
+  - name: Hermes chat 2
+    dir: ~/Music
+    command: hermes
+  - name: Wanted music
+    dir: ~/Music
+    command: nano wanted
+- name: Diabetes
+  sessions:
+  - name: Meal planner
+    dir: ~/Documents/projects/diabetes/mealplanner
+    command: bun run main.ts
+  - name: Sugar tracker
+    dir: ~/Documents/projects/diabetes/sugar
+    command: ./run.sh
+  - name: Diabetes 3
+    dir: ~/Documents/projects/diabetes/mealplanner
+    command: bash
+- name: Morphology
+  sessions:
+  - name: morpheus
+    dir: ~/Documents/projects/morpheus
+    command: bash
+- name: HTGAA
+  sessions:
+  - name: website
+    dir: ~/Documents/projects/webpages
+    command: bash
+- name: Study
+  sessions:
+  - name: Papers
+    dir: ~/Documents/papers
+    command: bash
+  - name: Podcasts
+    dir: ~/Dropbox/Notes/Obsidian/consumption/Podcasts/podcast-learn
+    command: bash
+- name: Scratch
+  sessions:
+  - name: Dev
+    dir: ~/Documents/projects/termem/project2
+  - name: Scratch 2
+    dir: ~/Documents/projects/termem/project2
+- name: Transient
+  sessions:
+  - name: Transient 1
+    dir: '~'

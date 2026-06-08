@@ -3,16 +3,16 @@
 //!     cargo run --example demo          # or: scripts/demo-screenshot.sh
 //!
 //! It drives the *real* UI headlessly (via the test harness) over the custom
-//! full-stack workspace in `demo/workspace`, feeds a few sessions with
+//! full-stack workspace in `demo/termset.yml`, feeds a few sessions with
 //! realistic, colourful output, and writes the rendered frame to
 //! `demo/screenshot.png` — no window, no PTY, deterministic.
 
 use std::path::Path;
 
-use termem_demo::testkit::Harness;
+use termset_cli::testkit::Harness;
 
 /// The custom workspace shown in the demo (a typical full-stack app layout).
-const WORKSPACE: &str = include_str!("../demo/workspace");
+const WORKSPACE: &str = include_str!("../demo/termset.yml");
 
 // Vite dev server (Frontend / web) — the selected, visible session.
 const WEB_OUT: &str = concat!(

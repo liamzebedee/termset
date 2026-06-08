@@ -1,0 +1,42 @@
+groups:
+  - name: Frontend
+    sessions:
+      - name: web
+        dir: ~/app/web
+        command: npm run dev
+      - name: storybook
+        dir: ~/app/web
+        command: npm run storybook
+      - name: claude
+        dir: ~/app/web
+        command: claude
+  - name: Backend
+    sessions:
+      - name: api
+        dir: ~/app/api
+        command: cargo watch -x run
+      - name: worker
+        dir: ~/app/api
+        command: cargo run --bin worker
+      - name: claude
+        dir: ~/app/api
+        command: claude
+  - name: Infra
+    sessions:
+      - name: postgres
+        dir: ~/app
+        command: docker compose up db
+      - name: redis
+        dir: ~/app
+        command: redis-server
+      - name: claude
+        dir: ~/app
+        command: claude
+  - name: Tools
+    sessions:
+      - name: logs
+        dir: ~/app
+        command: tail -f log/dev.log
+      - name: claude
+        dir: ~/app
+        command: claude

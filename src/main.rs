@@ -1,6 +1,6 @@
-//! Thin binary shim. All logic lives in the library crate (`termem_demo`)
+//! Thin binary shim. All logic lives in the library crate (`termset_cli`)
 //! so the integration harness in `testkit` can drive it headlessly.
 
 fn main() {
-    termem_demo::run();
+    termset_cli::run();
 }

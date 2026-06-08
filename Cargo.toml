@@ -1,13 +1,21 @@
 [package]
-name = "termem-demo"
+name = "termset-cli"
 version = "0.1.0"
 edition = "2024"
+
+# The CLI binary is `mtm`; the library crate stays `termem_demo` (the test
+# harness in `testkit` drives it headlessly).
+[[bin]]
+name = "terms"
+path = "src/main.rs"
 
 [dependencies]
 alacritty_terminal = "0.26.0"
 arboard = "3.6.1"
 fontdue = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 softbuffer = "0.4"
 winit = "0.30"
 

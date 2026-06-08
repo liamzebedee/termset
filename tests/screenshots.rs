@@ -4,18 +4,29 @@
 //!
 //! Each `screenshot(..)` prints `Screenshot taken: <path>`.
 
-use termem_demo::testkit::Harness;
+use termset_cli::testkit::Harness;
 
-/// A workspace spec in the on-disk format (tab-indented; name / dir / command
-/// tab-separated). `parse_workspace` also appends Scratch + Transient.
-const WORKSPACE: &str = "workspaces
-\tApps
-\t\t\"qwen\"\t~/.apps\t./run-llama.sh
-\tDiabetes
-\t\t\"Meal planner\"\t~/diabetes/mealplanner\t\"bun run main.ts\"
-\t\t\"Sugar tracker\"\t~/diabetes/sugar\t./run.sh
-\tStudy
-\t\t\"Papers\"\t~/papers\tbash
+/// A workspace spec in the on-disk YAML layout format.
+const WORKSPACE: &str = "\
+groups:
+  - name: Apps
+    sessions:
+      - name: qwen
+        dir: ~/.apps
+        command: ./run-llama.sh
+  - name: Diabetes
+    sessions:
+      - name: Meal planner
+        dir: ~/diabetes/mealplanner
+        command: bun run main.ts
+      - name: Sugar tracker
+        dir: ~/diabetes/sugar
+        command: ./run.sh
+  - name: Study
+    sessions:
+      - name: Papers
+        dir: ~/papers
+        command: bash
 ";
 
 const SAMPLE: &str = concat!(

@@ -1,7 +1,0 @@
-frontend/
-	bun dev.ts
-	claude
-backend/
-	python manage.py runserver
-	claude
-

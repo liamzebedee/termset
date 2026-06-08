@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
-# install-icon.sh — give the termem binary a real icon + launcher entry on
+# install-icon.sh — give the termset binary (mtm) a real icon + launcher entry on
 # Ubuntu (GNOME). Idempotent: re-run it any time to *update* the icon and
 # desktop entry (it overwrites in place and refreshes the icon/desktop caches).
 #
 # What it installs (per-user, no sudo):
-#   ~/.local/share/icons/hicolor/scalable/apps/termem.svg   (+ PNG sizes)
-#   ~/.local/share/applications/termem.desktop
+#   ~/.local/share/icons/hicolor/scalable/apps/termset.svg   (+ PNG sizes)
+#   ~/.local/share/applications/termset.desktop
 #
-# The .desktop sets StartupWMClass=termem, which the app sets as its X11
+# The .desktop sets StartupWMClass=termset, which the app sets as its X11
 # WM class / Wayland app_id (see src/main.rs), so the dock/launcher icon
 # binds to the running window.
 
@@ -16,12 +16,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "$SCRIPT_DIR")"
-BIN="$REPO/target/release/termem-demo"
+BIN="$REPO/target/release/terms"
 
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 ICON_BASE="$DATA/icons/hicolor"
 APPS="$DATA/applications"
-DESKTOP="$APPS/termem.desktop"
+DESKTOP="$APPS/termset.desktop"
 
 log() { printf '  %s\n' "$*"; }
 
@@ -36,44 +36,43 @@ fi
 #    borderless Win2k window — left tree sidebar with the info square,
 #    a gradient title bar, and a terminal with run markers + cursor.
 mkdir -p "$ICON_BASE/scalable/apps"
-SVG="$ICON_BASE/scalable/apps/termem.svg"
+SVG="$ICON_BASE/scalable/apps/termset.svg"
 cat > "$SVG" <<'SVG'
-<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
   <defs>
-    <linearGradient id="title" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#d9d9d9"/>
-      <stop offset="1" stop-color="#bebebe"/>
+    <!-- Dark-green terminal vignette (matches our prompt background) -->
+    <radialGradient id="bgr" cx="50%" cy="42%" r="75%">
+      <stop offset="0%"  stop-color="#3a7361"/>
+      <stop offset="60%" stop-color="#244a3e"/>
+      <stop offset="100%" stop-color="#15241d"/>
+    </radialGradient>
+    <!-- Light-blue powerline prompt -->
+    <linearGradient id="prompt" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#a9dcf7"/>
+      <stop offset="100%" stop-color="#6cb6e6"/>
+    </linearGradient>
+    <!-- Top sheen -->
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="14%"  stop-color="#ffffff" stop-opacity="0"/>
     </linearGradient>
   </defs>
-  <!-- window body + explicit Win2k border -->
-  <rect x="20" y="28" width="216" height="200" fill="#ffffff"
-        stroke="#1a1a1a" stroke-width="5"/>
-  <!-- title bar -->
-  <rect x="22.5" y="30.5" width="211" height="34" fill="url(#title)"/>
-  <line x1="22.5" y1="64.5" x2="233.5" y2="64.5" stroke="#808080" stroke-width="2"/>
-  <!-- window buttons -->
-  <rect x="170" y="40" width="14" height="3" fill="#1a1a1a"/>
-  <rect x="192" y="38" width="13" height="13" fill="none" stroke="#1a1a1a" stroke-width="2"/>
-  <path d="M214 38 l13 13 M227 38 l-13 13" stroke="#1a1a1a" stroke-width="2"/>
-  <!-- left sidebar -->
-  <rect x="22.5" y="64.5" width="66" height="161" fill="#c0c0c0"/>
-  <line x1="88.5" y1="64.5" x2="88.5" y2="225.5" stroke="#808080" stroke-width="2"/>
-  <!-- info square (the inspector toggle) -->
-  <rect x="31" y="73" width="16" height="16" fill="#ffffff" stroke="#1a1a1a" stroke-width="2"/>
-  <rect x="38" y="76.5" width="3" height="3" fill="#1a1a1a"/>
-  <rect x="38" y="81" width="3" height="6" fill="#1a1a1a"/>
-  <!-- tree rows -->
-  <rect x="31" y="98"  width="46" height="6" fill="#7a7a7a"/>
-  <rect x="37" y="110" width="40" height="6" fill="#9a9a9a"/>
-  <rect x="37" y="122" width="40" height="6" fill="#9a9a9a"/>
-  <rect x="31" y="134" width="46" height="6" fill="#7a7a7a"/>
-  <!-- terminal content -->
-  <rect x="100" y="80"  width="118" height="7" fill="#1a1a1a"/>
-  <rect x="100" y="80"  width="9"   height="7" fill="#107c10"/>
-  <rect x="100" y="98"  width="92"  height="7" fill="#3a3a3a"/>
-  <rect x="100" y="116" width="104" height="7" fill="#3a3a3a"/>
-  <rect x="100" y="134" width="70"  height="7" fill="#3a3a3a"/>
-  <rect x="100" y="152" width="11"  height="13" fill="#1a1a1a"/>
+
+  <!-- Rounded terminal body -->
+  <rect x="20" y="20" width="216" height="216" rx="46" fill="url(#bgr)"/>
+  <rect x="20" y="20" width="216" height="216" rx="46" fill="url(#sheen)"/>
+  <!-- Inner edge for a touch of depth -->
+  <rect x="20.5" y="20.5" width="215" height="215" rx="45.5"
+        fill="none" stroke="#000000" stroke-opacity="0.30" stroke-width="1"/>
+  <rect x="22.5" y="22.5" width="211" height="211" rx="44"
+        fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="1"/>
+
+  <!-- >_  light-blue powerline prompt -->
+  <g fill="none" stroke="url(#prompt)" stroke-width="20"
+     stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="84,92 128,131 84,170"/>
+  </g>
+  <rect x="132" y="158" width="56" height="18" rx="9" fill="url(#prompt)"/>
 </svg>
 SVG
 log "icon  -> $SVG"
@@ -81,11 +80,12 @@ log "icon  -> $SVG"
 # 3. Rasterize a few PNG sizes too, if a converter is available (optional;
 #    GNOME renders the SVG fine on its own).
 rasterize() {
-    local size="$1" out="$ICON_BASE/${1}x${1}/apps/termem.png"
+    local size="$1" out="$ICON_BASE/${1}x${1}/apps/termset.png"
     mkdir -p "$(dirname "$out")"
-    if   command -v rsvg-convert >/dev/null; then rsvg-convert -w "$size" -h "$size" "$SVG" -o "$out"
-    elif command -v inkscape     >/dev/null; then inkscape "$SVG" --export-type=png -w "$size" -h "$size" -o "$out" >/dev/null 2>&1
-    elif command -v convert      >/dev/null; then convert -background none -resize "${size}x${size}" "$SVG" "$out"
+    if   command -v rsvg-convert            >/dev/null; then rsvg-convert -w "$size" -h "$size" "$SVG" -o "$out"
+    elif command -v inkscape                >/dev/null; then inkscape "$SVG" --export-type=png -w "$size" -h "$size" -o "$out" >/dev/null 2>&1
+    elif command -v gdk-pixbuf-thumbnailer  >/dev/null; then gdk-pixbuf-thumbnailer -s "$size" "$SVG" "$out"
+    elif command -v convert                 >/dev/null; then convert -background none -density 384 "$SVG" -resize "${size}x${size}" "$out"
     else return 1
     fi
     log "icon  -> $out"
@@ -99,15 +99,15 @@ cat > "$DESKTOP" <<EOF
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=termem
+Name=termset
 GenericName=Workspace Terminal
-Comment=Workspace-organized terminal emulator
+Comment=Save your terminal layouts
 Exec=$BIN
 Path=$REPO
-Icon=termem
+Icon=termset
 Terminal=false
 Categories=System;TerminalEmulator;
-StartupWMClass=termem
+StartupWMClass=termset
 StartupNotify=true
 EOF
 chmod +x "$DESKTOP"
@@ -120,5 +120,5 @@ update-desktop-database "$APPS"          >/dev/null 2>&1 || true
 command -v gio >/dev/null && gio set "$DESKTOP" metadata::trusted true >/dev/null 2>&1 || true
 
 echo
-echo "Done. 'termem' is now in your app grid / dock."
+echo "Done. 'termset' is now in your app grid / dock."
 echo "If the icon doesn't refresh immediately, log out and back in."
