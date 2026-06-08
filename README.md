@@ -2,16 +2,15 @@
 
 **Save your terminal layouts.**
 
-- Store your terminal layout in a YAML file you can commit into git and open the same on your other devices
-- Re-open the same Claude Code instances for different projects
-- Work with your locally-developed software setups without long-lived Terminal instances
+- Save your terminal layout to a YAML file that you can commit into git and open the same on your other devices
+- Group and label terminal tabs
 
 Termset is a terminal app, written in Rust. It uses [Alacritty](https://github.com/alacritty/alacritty), a fast cross-platform OpenGL terminal emulator under the hood.
 
 ## Usage
 
 ```
-$ terms termset.yml     # open a layout file (created if missing)
+$ terms terminals.yml     # open a layout file (created if missing)
 $ terms                 # use ./termset.yml in the current directory
 ```
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# install-icon.sh — give the termset binary (mtm) a real icon + launcher entry on
+# install-icon.sh — give the termset binary (terms) a real icon + launcher entry on
 # Ubuntu (GNOME). Idempotent: re-run it any time to *update* the icon and
 # desktop entry (it overwrites in place and refreshes the icon/desktop caches).
 #
@@ -112,6 +112,26 @@ StartupNotify=true
 EOF
 chmod +x "$DESKTOP"
 log "entry -> $DESKTOP"
+
+# 4b. Clean up legacy artifacts from when the bin was named `mtm` and the
+#     launcher was `termem.desktop`. cargo leaves the old binary behind on a
+#     rename, and the dock/dash can stay pinned to the dead .desktop — so a
+#     taskbar click launches a stale build (or nothing). Remove both, and
+#     migrate any dash pin to the current entry.
+STALE_BIN="$REPO/target/release/mtm"
+STALE_DESKTOP="$APPS/termem.desktop"
+[ -e "$STALE_BIN" ]     && { rm -f "$STALE_BIN";     log "removed stale binary  -> $STALE_BIN"; }
+[ -e "$STALE_DESKTOP" ] && { rm -f "$STALE_DESKTOP"; log "removed stale launcher -> $STALE_DESKTOP"; }
+
+if command -v dconf >/dev/null; then
+    favs=$(dconf read /org/gnome/shell/favorite-apps 2>/dev/null || true)
+    case "$favs" in
+        *"'termem.desktop'"*)
+            dconf write /org/gnome/shell/favorite-apps \
+                "$(printf '%s' "$favs" | sed "s/'termem.desktop'/'termset.desktop'/")"
+            log "repinned dash: termem.desktop -> termset.desktop" ;;
+    esac
+fi
 
 # 5. Refresh caches so the change shows up without a re-login.
 gtk-update-icon-cache -f -t "$ICON_BASE" >/dev/null 2>&1 || true

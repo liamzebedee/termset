@@ -1,0 +1,18 @@
+# Default layout for a brand-new (missing or empty) workspace.
+#
+# This file is compiled into the `terms` binary at build time (include_str!),
+# so it's the template used whenever a layout file doesn't exist yet. Edit it to
+# change what a fresh workspace starts with, then rebuild to apply.
+#
+# Placeholders, substituted at runtime (YAML-escaped, so spaces/colons are safe):
+#   {{name}}  ->  the current directory's basename
+#   {{dir}}   ->  the current directory's absolute path
+#
+# Schema: groups -> sessions, each with name / dir / command.
+#   dir:      `~` is allowed; empty or absent means $HOME.
+#   command:  default command run by Start; empty means a bare shell.
+groups:
+- name: Project
+  sessions:
+  - name: Project 1
+    dir: {{dir}}
