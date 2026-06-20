@@ -21,6 +21,7 @@ pub(crate) const FG: u32 = 0xea_ea_ea; // terminal default text (white)
 // blends with the image.
 pub(crate) const BG: u32 = 0x0b_1d_1d;
 pub(crate) const SEL: u32 = 0x2f_5d_6e; // selection fill (white text stays readable)
+pub(crate) const HOVER: u32 = 0x1c_1c_1c; // sidebar row hover fill (a hair above STRIP_BG; text stays readable)
 
 // --- Win2k chrome ----------------------------------------------------------
 // Windows 2000 design *principles* (not its colours): explicit borders and
@@ -565,6 +566,7 @@ pub(crate) fn draw_sidebar(
     r: &mut Renderer,
     rows: &[Row],
     selected: NodeId,
+    hovered: Option<NodeId>,
     sidebar_w: usize,
 ) {
     fill_rect(buf, pw, ph, 0, 0, sidebar_w, ph, STRIP_BG);
@@ -594,6 +596,11 @@ pub(crate) fn draw_sidebar(
             // The selection band still spans the full pane; only the label text
             // is inset, so the highlight stays edge-to-edge.
             fill_rect(buf, pw, ph, 0, y, sidebar_w - 1, rh, SEL);
+        } else if hovered == Some(row.id) {
+            // A faint lightening of the unselected row under the pointer — just
+            // enough to read as "this is the target", not enough to compete with
+            // the selection band. Same edge-to-edge span as the selection fill.
+            fill_rect(buf, pw, ph, 0, y, sidebar_w - 1, rh, HOVER);
         }
         // No markers: hierarchy reads from colour alone — top-level rows
         // (sections, and the standalone "Edit Config" session) full-ink, nested

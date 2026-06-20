@@ -73,6 +73,7 @@ impl Harness {
             cursor: winit::window::CursorIcon::Default,
             win_hover: None,
             header_hover: false,
+            sidebar_hover: None,
         };
         let dir = std::env::temp_dir().join(format!(
             "termem-shots-{}-{}",

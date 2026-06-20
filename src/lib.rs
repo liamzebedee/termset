@@ -1016,6 +1016,31 @@ fn spawn_session(
     )
 }
 
+/// The directory the layout file lives in — the base for resolving relative
+/// session `dir`s. Falls back to the current directory when the layout path has
+/// no usable parent (e.g. a bare filename).
+fn layout_dir(ws_path: &Path) -> PathBuf {
+    ws_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| home_dir()))
+}
+
+/// Resolve a session's working directory for spawning. A relative `dir` (e.g.
+/// `../filex`) resolves against the layout file's directory, so it points at the
+/// same place regardless of where `terms` was launched from — and stays portable
+/// when the layout is committed and opened on another machine. Absolute paths
+/// (including `~`-expanded ones) pass through unchanged. The relative form is
+/// kept in the tree, so it round-trips back to the YAML on save.
+fn resolve_workdir(base: &Path, dir: &Path) -> PathBuf {
+    if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        base.join(dir)
+    }
+}
+
 /// A live session bound to a leaf node.
 struct Session {
     tab: Tab,
@@ -1111,6 +1136,9 @@ struct State {
     /// Whether the pointer is over the title bar (top `HEADER_H` strip), which
     /// gets a slight highlight so it reads as the draggable region.
     header_hover: bool,
+    /// The sidebar row the pointer is currently over (if any), drawn with a
+    /// faint hover fill. `None` when off the tree or over the selected row.
+    sidebar_hover: Option<NodeId>,
 }
 
 impl State {
@@ -1247,6 +1275,7 @@ impl State {
                 &mut self.renderer,
                 &rows,
                 sel,
+                self.sidebar_hover,
                 sw,
             );
         }
@@ -1475,6 +1504,7 @@ impl App {
 
     /// Effect: spawn an idle PTY for leaf `node` in its workdir.
     fn spawn_for(&mut self, node: NodeId) {
+        let base = layout_dir(&self.ws_path);
         let Some(st) = self.state.as_mut() else { return };
         if st.sessions.contains_key(&node) {
             return;
@@ -1493,7 +1523,7 @@ impl App {
             &self.proxy,
             id,
             name,
-            Some(workdir),
+            Some(resolve_workdir(&base, &workdir)),
             size,
             st.renderer.cell_w,
             st.renderer.cell_h,
@@ -1634,11 +1664,7 @@ impl App {
             }
         }
         let path = self.ws_path.clone();
-        let dir = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| home_dir()));
+        let dir = layout_dir(&path);
         // `exec` replaces the shell with nano, so quitting nano ends the PTY →
         // the dynamic session auto-closes (see the `UserEvent::Exit` handler).
         let command = format!("exec nano {}", shell_quote(&path));
@@ -2155,6 +2181,7 @@ impl ApplicationHandler<UserEvent> for App {
             cursor: CursorIcon::Default,
             win_hover: None,
             header_hover: false,
+            sidebar_hover: None,
         };
         self.state = Some(st);
 
@@ -2174,6 +2201,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.redraw();
         self.redraw();
 
+        let base = layout_dir(&self.ws_path);
         let st = self.state.as_mut().unwrap();
         let (lw, lh) = st.logical_size();
         let size = st.grid_size(lw, lh);
@@ -2193,7 +2221,7 @@ impl ApplicationHandler<UserEvent> for App {
                 &self.proxy,
                 id,
                 name,
-                Some(workdir),
+                Some(resolve_workdir(&base, &workdir)),
                 size,
                 st.renderer.cell_w,
                 st.renderer.cell_h,
@@ -2336,6 +2364,16 @@ impl ApplicationHandler<UserEvent> for App {
                         && (st.mouse.0 as usize) < pw;
                     if over_header != st.header_hover {
                         st.header_hover = over_header;
+                        st.request_redraw();
+                    }
+                    // Sidebar row hover: a faint fill follows the pointer down
+                    // the tree. Repaint only when the row under it changes.
+                    let rows = st.tree.rows(st.selected);
+                    let row_hover = st
+                        .sidebar_hit(st.mouse.0, st.mouse.1, &rows)
+                        .map(|(id, _)| id);
+                    if row_hover != st.sidebar_hover {
+                        st.sidebar_hover = row_hover;
                         st.request_redraw();
                     }
                     // Repaint while a context menu is open so its hover bar
@@ -2786,6 +2824,43 @@ groups:
             groups,
             ["Apps", "Music", "Diabetes", "Morphology", "HTGAA", "Study"]
         );
+    }
+
+    #[test]
+    fn resolve_workdir_handles_relative_and_absolute() {
+        let base = Path::new("/home/u/projects/app");
+        // A relative dir (the `../filex` shortcut) resolves against the layout
+        // file's directory, not the process cwd. `..`/`.` are left for the OS to
+        // collapse when it sets the spawned shell's cwd (join is lexical).
+        assert_eq!(
+            resolve_workdir(base, Path::new("../filex")),
+            Path::new("/home/u/projects/app/../filex"),
+        );
+        assert_eq!(
+            resolve_workdir(base, Path::new("sub")),
+            Path::new("/home/u/projects/app/sub"),
+        );
+        // Absolute and ~-expanded dirs are left untouched.
+        assert_eq!(
+            resolve_workdir(base, Path::new("/etc")),
+            Path::new("/etc"),
+        );
+    }
+
+    #[test]
+    fn relative_dir_round_trips_through_yaml() {
+        // A relative `dir` parses as-is and survives a save → reload, so the
+        // portable `../filex` form is never rewritten to an absolute path.
+        let home = Path::new("/home/u");
+        let t = parse_workspace(
+            "groups:\n  - name: P\n    sessions:\n      - name: s\n        dir: ../filex\n",
+            home,
+        );
+        let leaf = t.leaves(t.root)[0];
+        assert_eq!(t.leaf_spec(leaf).unwrap().0, Path::new("../filex"));
+        let reloaded = parse_workspace(&serialize_workspace(&t, home), home);
+        let rleaf = reloaded.leaves(reloaded.root)[0];
+        assert_eq!(reloaded.leaf_spec(rleaf).unwrap().0, Path::new("../filex"));
     }
 
     #[test]
