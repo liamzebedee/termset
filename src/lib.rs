@@ -1261,6 +1261,21 @@ impl State {
                 FONT_PX,
                 &self.link_cells,
             );
+            let grid = term.grid();
+            draw_scrollbar(
+                &mut buf,
+                pw,
+                ph,
+                HEADER_H,
+                tr,
+                ph.saturating_sub(HEADER_H),
+                SBAR_W,
+                SBAR_PAD,
+                SBAR_MIN,
+                grid.display_offset(),
+                grid.history_size(),
+                grid.screen_lines(),
+            );
             drop(term);
         } else {
             draw_text(
@@ -1409,6 +1424,21 @@ impl State {
             cell_h,
             font_px,
             &self.link_cells,
+        );
+        let grid = term.grid();
+        draw_scrollbar(
+            buf,
+            pw,
+            ph,
+            origin_y,
+            clip_right,
+            ph.saturating_sub(origin_y),
+            ((SBAR_W as f64 * sx).round() as usize).max(1),
+            (SBAR_PAD as f64 * sx).round() as usize,
+            ((SBAR_MIN as f64 * sy).round() as usize).max(1),
+            grid.display_offset(),
+            grid.history_size(),
+            grid.screen_lines(),
         );
     }
 

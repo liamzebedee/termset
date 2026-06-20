@@ -171,6 +171,20 @@ impl Harness {
         self
     }
 
+    /// Scroll the shown terminal back into its scrollback by `lines` (positive
+    /// scrolls up, into history), so screenshots can show a scrolled viewport
+    /// and its scrollbar thumb.
+    pub fn scroll(&mut self, lines: i32) -> &mut Self {
+        if let Some(node) = self.state.shown() {
+            self.state.sessions[&node]
+                .tab
+                .term
+                .lock()
+                .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+        }
+        self
+    }
+
     /// Change the device scale (e.g. 2.0 to emulate macOS Retina) and reflow.
     pub fn set_scale(&mut self, scale: f64) -> &mut Self {
         self.state.scale = scale.max(1.0);
