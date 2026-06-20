@@ -70,6 +70,7 @@ impl Harness {
             focus: None,
             caret: 0,
             scroll_acc: 0.0,
+            sbar_drag: None,
             cursor: winit::window::CursorIcon::Default,
             win_hover: None,
             header_hover: false,

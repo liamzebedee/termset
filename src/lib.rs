@@ -1152,6 +1152,10 @@ struct State {
     /// Sub-line wheel remainder, so a high-resolution touchpad's many small
     /// deltas accumulate into whole-line scrolls instead of being dropped.
     scroll_acc: f64,
+    /// Active scrollbar-thumb drag: the pointer's grab offset *within* the
+    /// thumb (logical px), so dragging stays anchored to where it was grabbed.
+    /// `None` when not dragging the bar.
+    sbar_drag: Option<f64>,
     /// Cursor icon currently set on the window, so `set_cursor` is only called
     /// when the shape actually changes (e.g. entering/leaving a resize grip)
     /// rather than on every mouse-move event.
@@ -1225,12 +1229,15 @@ impl State {
         let ch = self.renderer.cell_h;
         // Right edge of the terminal: the inspector pane (if open) eats into it.
         let tr = term_right(pw, self.inspector);
+        // Right edge of the cell grid: short of the scrollbar gutter.
+        let tcr = term_content_right(pw, self.inspector);
         // Left edge of the terminal: the sidebar (auto-sized; 0 when hidden).
         let sw = self.sidebar_w();
 
         // --- terminal area --------------------------------------------------
         // Lay the backdrop image behind the grid; cells without their own
-        // background let it show through (the dark theme).
+        // background let it show through (the dark theme). Covers the gutter too,
+        // so the scrollbar sits over the backdrop.
         fill_backdrop(
             &mut buf,
             pw,
@@ -1240,6 +1247,9 @@ impl State {
             tr.saturating_sub(sw),
             ph.saturating_sub(HEADER_H),
         );
+        // Scrollback state of the shown terminal (idle when nothing is shown), so
+        // the scrollbar can always be drawn in its gutter.
+        let mut scroll_state = (0usize, 0usize, 1usize); // (offset, history, screen)
         if let Some(node) = shown {
             // Render the grid at logical (1×) size into `buf`. The GUI redraw
             // re-renders it crisply at device resolution on Retina; the test
@@ -1255,27 +1265,14 @@ impl State {
                 lines,
                 sw,
                 HEADER_H,
-                tr,
+                tcr,
                 cw,
                 ch,
                 FONT_PX,
                 &self.link_cells,
             );
             let grid = term.grid();
-            draw_scrollbar(
-                &mut buf,
-                pw,
-                ph,
-                HEADER_H,
-                tr,
-                ph.saturating_sub(HEADER_H),
-                SBAR_W,
-                SBAR_PAD,
-                SBAR_MIN,
-                grid.display_offset(),
-                grid.history_size(),
-                grid.screen_lines(),
-            );
+            scroll_state = (grid.display_offset(), grid.history_size(), grid.screen_lines());
             drop(term);
         } else {
             draw_text(
@@ -1290,6 +1287,20 @@ impl State {
                 INK_DIM,
             );
         }
+
+        // --- scrollbar (its own gutter, always present) ---------------------
+        let (offset, history, screen) = scroll_state;
+        draw_scrollbar(
+            &mut buf,
+            pw,
+            ph,
+            scrollbar_rect(pw, ph, self.inspector),
+            offset,
+            history,
+            screen,
+            SBAR_MIN,
+            self.sbar_drag.is_some(),
+        );
 
         // --- header bar over the terminal ----------------------------------
         // (No title text — the path/status label is intentionally hidden.)
@@ -1392,7 +1403,10 @@ impl State {
         let sy = sx;
         let origin_x = (self.sidebar_w() as f64 * sx).round() as usize;
         let origin_y = (HEADER_H as f64 * sy).round() as usize;
-        let clip_right = ((term_right(lw, self.inspector) as f64 * sx).round() as usize).min(pw);
+        // Full viewport (incl. the scrollbar gutter) vs. the cell grid (short of
+        // it). Backdrop refills the whole viewport; cells clip to the content.
+        let view_right = ((term_right(lw, self.inspector) as f64 * sx).round() as usize).min(pw);
+        let clip_right = ((term_content_right(lw, self.inspector) as f64 * sx).round() as usize).min(pw);
         let cell_w = ((self.renderer.cell_w as f64 * sx).round() as usize).max(1);
         let cell_h = ((self.renderer.cell_h as f64 * sy).round() as usize).max(1);
         let font_px = FONT_PX * sy as f32;
@@ -1406,7 +1420,7 @@ impl State {
             ph,
             origin_x,
             origin_y,
-            clip_right.saturating_sub(origin_x),
+            view_right.saturating_sub(origin_x),
             ph.saturating_sub(origin_y),
         );
         let term = self.sessions[&node].tab.term.lock();
@@ -1426,19 +1440,27 @@ impl State {
             &self.link_cells,
         );
         let grid = term.grid();
+        let (offset, history, screen) = (grid.display_offset(), grid.history_size(), grid.screen_lines());
+        drop(term);
+        // Scrollbar, redrawn crisply: scale the logical track rect by the device
+        // scale so it lands exactly over the gutter the backdrop just refilled.
+        let (rx, ry, rw, rh) = scrollbar_rect(lw, lh, self.inspector);
+        let rect = (
+            (rx as f64 * sx).round() as usize,
+            (ry as f64 * sy).round() as usize,
+            ((rw as f64 * sx).round() as usize).max(1),
+            (rh as f64 * sy).round() as usize,
+        );
         draw_scrollbar(
             buf,
             pw,
             ph,
-            origin_y,
-            clip_right,
-            ph.saturating_sub(origin_y),
-            ((SBAR_W as f64 * sx).round() as usize).max(1),
-            (SBAR_PAD as f64 * sx).round() as usize,
+            rect,
+            offset,
+            history,
+            screen,
             ((SBAR_MIN as f64 * sy).round() as usize).max(1),
-            grid.display_offset(),
-            grid.history_size(),
-            grid.screen_lines(),
+            self.sbar_drag.is_some(),
         );
     }
 
@@ -1452,6 +1474,48 @@ impl State {
             .leaves(self.selected)
             .into_iter()
             .find(|l| self.sessions.contains_key(l))
+    }
+
+    /// `(display_offset, history_size, screen_lines)` of the shown terminal's
+    /// grid — the scrollback geometry the scrollbar draws and drags from. `None`
+    /// when nothing is shown.
+    fn scroll_metrics(&self) -> Option<(usize, usize, usize)> {
+        let node = self.shown()?;
+        let term = self.sessions[&node].tab.term.lock();
+        let g = term.grid();
+        Some((g.display_offset(), g.history_size(), g.screen_lines()))
+    }
+
+    /// Drag/click the scrollbar: move the viewport so the thumb's top sits at
+    /// logical-y `top`. Maps the thumb position back to a display offset and
+    /// scrolls there. No-op without scrollback. Mirrors [`scrollbar_thumb`], so
+    /// the grab tracks the drawn thumb exactly.
+    fn scroll_to_thumb_top(&mut self, top: f64) {
+        let Some(node) = self.shown() else { return };
+        let (pw, ph) = self.logical_size();
+        let (_, area_y, _, area_h) = scrollbar_rect(pw, ph, self.inspector);
+        let mut term = self.sessions[&node].tab.term.lock();
+        let (offset, history, screen) = {
+            let g = term.grid();
+            (g.display_offset(), g.history_size(), g.screen_lines())
+        };
+        if history == 0 {
+            return;
+        }
+        let (_, thumb_h) = scrollbar_thumb(area_y, area_h, offset, history, screen, SBAR_MIN);
+        let span = area_h.saturating_sub(thumb_h) as f64;
+        if span <= 0.0 {
+            return;
+        }
+        let frac = ((top - area_y as f64) / span).clamp(0.0, 1.0);
+        // `frac == 0` is the top (offset == history); `frac == 1` the bottom.
+        let target = (history as f64 * (1.0 - frac)).round() as i32;
+        let delta = target - offset as i32;
+        if delta != 0 {
+            term.scroll_display(Scroll::Delta(delta));
+            drop(term);
+            self.request_redraw();
+        }
     }
 
     /// Logical width of the sidebar pane: `0` when hidden, otherwise the left
@@ -1488,7 +1552,7 @@ impl State {
     /// Grid size for the terminal area (window minus sidebar, header and —
     /// when open — the right inspector pane).
     fn grid_size(&self, win_w: usize, win_h: usize) -> TermSize {
-        let avail = term_right(win_w, self.inspector).saturating_sub(self.sidebar_w());
+        let avail = term_content_right(win_w, self.inspector).saturating_sub(self.sidebar_w());
         TermSize {
             cols: (avail / self.renderer.cell_w).max(1),
             lines: (win_h.saturating_sub(HEADER_H) / self.renderer.cell_h).max(1),
@@ -1543,8 +1607,8 @@ impl State {
         let node = self.shown()?;
         let (pw, _) = self.logical_size();
         let sw = self.sidebar_w();
-        let tr = term_right(pw, self.inspector);
-        // Outside the terminal viewport (sidebar, header, inspector): no link.
+        let tr = term_content_right(pw, self.inspector);
+        // Outside the terminal viewport (sidebar, header, inspector, gutter): no link.
         if self.mouse.0 < sw as f64
             || (self.mouse.0 as usize) >= tr
             || self.mouse.1 < HEADER_H as f64
@@ -2466,6 +2530,7 @@ impl ApplicationHandler<UserEvent> for App {
             focus: None,
             caret: 0,
             scroll_acc: 0.0,
+            sbar_drag: None,
             cursor: CursorIcon::Default,
             win_hover: None,
             header_hover: false,
@@ -2690,6 +2755,11 @@ impl ApplicationHandler<UserEvent> for App {
                             st.request_redraw();
                         }
                     }
+                    // Dragging the scrollbar thumb: track the pointer, keeping
+                    // the original grab offset so the thumb stays under the cursor.
+                    if let Some(grab) = st.sbar_drag {
+                        st.scroll_to_thumb_top(st.mouse.1 - grab);
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -2783,6 +2853,35 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
+                        // 5b. Scrollbar gutter: grab the thumb to drag, or click
+                        // the track to jump the thumb's centre to the cursor.
+                        // Either way begins a drag so the motion continues
+                        // smoothly. Swallows the click (the gutter is its own
+                        // space) even with no scrollback.
+                        {
+                            let rect = scrollbar_rect(pw, ph, self.state.as_ref().unwrap().inspector);
+                            if hit(rect, mx, my) {
+                                let (_, area_y, _, area_h) = rect;
+                                let grab = self
+                                    .state
+                                    .as_ref()
+                                    .unwrap()
+                                    .scroll_metrics()
+                                    .map(|(off, hist, scr)| {
+                                        let (top, th) = scrollbar_thumb(area_y, area_h, off, hist, scr, SBAR_MIN);
+                                        if my >= top as f64 && my < (top + th) as f64 {
+                                            my - top as f64 // anchored drag on the thumb
+                                        } else {
+                                            th as f64 / 2.0 // jump: centre the thumb on the cursor
+                                        }
+                                    })
+                                    .unwrap_or(0.0);
+                                let st = self.state.as_mut().unwrap();
+                                st.sbar_drag = Some(grab);
+                                st.scroll_to_thumb_top(my - grab);
+                                return;
+                            }
+                        }
                         // 6. Sidebar: a click selects the row; a group click
                         // also folds/unfolds it (there is no separate expander).
                         let sel = self.state.as_ref().unwrap().selected;
@@ -2812,8 +2911,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 }
                             }
                         }
-                        // 8. Terminal area: start a text selection.
-                        let tr = term_right(pw, self.state.as_ref().unwrap().inspector);
+                        // 8. Terminal area: start a text selection (content area
+                        // only — the scrollbar gutter was handled in step 5b).
+                        let tr = term_content_right(pw, self.state.as_ref().unwrap().inspector);
                         let sw = self.state.as_ref().unwrap().sidebar_w();
                         if mx >= sw as f64
                             && (mx as usize) < tr
@@ -2847,6 +2947,7 @@ impl ApplicationHandler<UserEvent> for App {
                     (MouseButton::Left, ElementState::Released) => {
                         if let Some(st) = self.state.as_mut() {
                             st.selecting = false;
+                            st.sbar_drag = None;
                         }
                         self.copy_to_clipboard();
                     }
@@ -2856,7 +2957,7 @@ impl ApplicationHandler<UserEvent> for App {
                         let (pw, _) = self.state.as_ref().unwrap().logical_size();
                         let sw = self.state.as_ref().unwrap().sidebar_w();
                         let inspector = self.state.as_ref().unwrap().inspector;
-                        let tr = term_right(pw, inspector);
+                        let tr = term_content_right(pw, inspector);
                         if let Some((node, _)) =
                             self.state.as_ref().unwrap().sidebar_hit(mx, my, &rows)
                         {

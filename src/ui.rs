@@ -47,11 +47,12 @@ pub(crate) const TLIGHT_R: f32 = 5.0; // traffic-light dot radius (px); diameter
 pub(crate) const EDGE: f64 = 9.0; // borderless-window resize-grip thickness (edges)
 pub(crate) const CORNER: f64 = 22.0; // larger square grab zone at each window corner
 
-// Scrollback indicator: a thin, semi-transparent bar at the right edge of the
-// terminal viewport. Sizes are logical (1×); the Retina pass scales them.
-pub(crate) const SBAR_W: usize = 4; // thumb/track width
-pub(crate) const SBAR_PAD: usize = 2; // inset from the viewport's right edge
-pub(crate) const SBAR_MIN: usize = 16; // minimum thumb height so it stays grabbable
+// Scrollbar: a wide, draggable bar in its own gutter at the right of the
+// terminal viewport — always present, separate from the text. Sizes are logical
+// (1×); the Retina pass scales them.
+pub(crate) const SBAR_GUTTER: usize = 14; // reserved column the bar lives in (content stops before it)
+pub(crate) const SBAR_W: usize = 8; // thumb/track width, centred in the gutter
+pub(crate) const SBAR_MIN: usize = 24; // minimum thumb height so it stays grabbable
 
 // macOS-style "traffic light" window controls (bitmap dots, not glyphs).
 pub(crate) const TLIGHT_MIN: u32 = 0xfe_bc_2e; // minimize — amber
@@ -602,39 +603,50 @@ pub(crate) fn blend_rect(buf: &mut [u32], pw: usize, ph: usize, x: usize, y: usi
     }
 }
 
-/// A minimal scrollback indicator at the right edge of the terminal viewport: a
-/// barely-there full-height track with a brighter thumb whose size and position
-/// come from the grid's scrollback. Geometry is in *target* pixels (like
-/// [`draw_terminal_cells`]) so the same routine serves the logical compose and
-/// the crisp Retina overdraw — pass `thick`/`pad`/`min_thumb` already scaled.
-/// Draws nothing when there's no scrollback (`history == 0`).
+/// The thumb's top-y and height inside a track of height `area_h` starting at
+/// `area_y`, for a grid scrolled `offset` lines up out of `history`, showing
+/// `screen` lines. Single source of truth for [`draw_scrollbar`] and the
+/// drag/click hit-testing in `lib.rs`, so the picture and the grab can't
+/// disagree. With no scrollback the thumb fills the whole track.
+pub(crate) fn scrollbar_thumb(area_y: usize, area_h: usize, offset: usize, history: usize, screen: usize, min_thumb: usize) -> (usize, usize) {
+    let total = (history + screen).max(1);
+    let thumb_h = (area_h * screen / total).max(min_thumb).min(area_h);
+    let span = area_h - thumb_h;
+    // `offset == history` is the top (fully scrolled back), `offset == 0` the
+    // bottom (live tail).
+    let top = if history == 0 { area_y } else { area_y + span * (history - offset) / history };
+    (top, thumb_h)
+}
+
+/// The scrollbar in its gutter at the right of the terminal viewport: an
+/// always-present faint track with a brighter, draggable thumb sized and
+/// positioned from the grid's scrollback. `rect` is the track column in *target*
+/// pixels (like [`draw_terminal_cells`]) so the same routine serves the logical
+/// compose and the crisp Retina overdraw; pass `min_thumb` already scaled.
+/// `active` brightens the thumb while it's being dragged.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_scrollbar(
     buf: &mut [u32],
     bw: usize,
     bh: usize,
-    area_y: usize,
-    area_right: usize,
-    area_h: usize,
-    thick: usize,
-    pad: usize,
-    min_thumb: usize,
+    rect: Rect,
     offset: usize,
     history: usize,
     screen: usize,
+    min_thumb: usize,
+    active: bool,
 ) {
-    if history == 0 || screen == 0 || area_h == 0 || thick == 0 {
+    let (x, y, w, h) = rect;
+    if w == 0 || h == 0 {
         return;
     }
-    let total = history + screen;
-    let x = area_right.saturating_sub(thick + pad);
-    // Faint guide so the thumb reads as a track, not a floating sliver.
-    blend_rect(buf, bw, bh, x, area_y, thick, area_h, 0xff_ff_ff, 16);
-    // Thumb height = fraction of content on screen; position = scroll offset,
-    // where `offset == history` is the top and `offset == 0` is the bottom.
-    let thumb_h = (area_h * screen / total).max(min_thumb).min(area_h);
-    let top = area_y + (area_h - thumb_h) * (history - offset) / history;
-    blend_rect(buf, bw, bh, x, top, thick, thumb_h, 0xff_ff_ff, 96);
+    // Track: always drawn so the gutter reads as "the scrollbar lives here".
+    blend_rect(buf, bw, bh, x, y, w, h, 0xff_ff_ff, 14);
+    let (top, thumb_h) = scrollbar_thumb(y, h, offset, history, screen, min_thumb);
+    // Dim and full-height when there's nothing to scroll; brighter when there
+    // is, brightest while dragging.
+    let a = if history == 0 { 28 } else if active { 150 } else { 92 };
+    blend_rect(buf, bw, bh, x, top, w, thumb_h, 0xff_ff_ff, a);
 }
 
 /// The left tree pane, rendered as plain monospace text on the terminal's own
@@ -920,6 +932,21 @@ pub(crate) fn panel_x(pw: usize) -> usize {
 /// Right edge of the live terminal area (shrinks when the inspector is open).
 pub(crate) fn term_right(pw: usize, inspector: bool) -> usize {
     if inspector { panel_x(pw) } else { pw }
+}
+
+/// Right edge of the terminal *content* (the cell grid): the viewport minus the
+/// scrollbar gutter, so the bar always has its own column separate from text.
+pub(crate) fn term_content_right(pw: usize, inspector: bool) -> usize {
+    term_right(pw, inspector).saturating_sub(SBAR_GUTTER)
+}
+
+/// The scrollbar's track rect (full terminal height, in its gutter), in logical
+/// pixels. Shared by draw and the click/drag hit-test. `x` is the thumb's left
+/// edge, centred within the gutter.
+pub(crate) fn scrollbar_rect(pw: usize, ph: usize, inspector: bool) -> Rect {
+    let gx = term_right(pw, inspector).saturating_sub(SBAR_GUTTER);
+    let x = gx + SBAR_GUTTER.saturating_sub(SBAR_W) / 2;
+    (x, HEADER_H, SBAR_W, ph.saturating_sub(HEADER_H))
 }
 
 /// `[minimize, maximize, close]` traffic-light hit cells, full header height and
