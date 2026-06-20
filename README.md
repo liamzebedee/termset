@@ -10,7 +10,7 @@ Termset is a terminal app, written in Rust. It uses [Alacritty](https://github.c
 ## Usage
 
 ```
-$ terms terminals.yml     # open a layout file (created if missing)
+$ terms terminals.yml     # open a layout file (a default layout opens if missing)
 $ terms                 # use ./termset.yml in the current directory
 ```
 
@@ -61,6 +61,5 @@ Special key is assumed as macOS (Cmd), Linux (Ctrl+Shift)
  - **Copy / Paste**. Ctrl+Shift+C / Ctrl+Shift+V (or right-click)
  - **Toggle sidebar**. Ctrl+Shift+B
  - **Edit layout**. Ctrl+Shift+, (opens the YAML in nano)
- - **Save current layout**. Ctrl+Shift+S
  - **Quit**. Ctrl+Shift+Q
 

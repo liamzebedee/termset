@@ -1,10 +1,11 @@
-//! Workspace layout configuration: the on-disk YAML schema, parsing to and
-//! serialization from the in-memory [`crate::Tree`], tilde (de)expansion, and
-//! resolution of which layout file / default template to open.
+//! Workspace layout configuration: the on-disk YAML schema, parsing it into the
+//! in-memory [`crate::Tree`], tilde expansion, and resolution of which layout
+//! file / default template to open. The layout file is read-only to the app —
+//! it is never written back; the user edits it by hand.
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{Kind, Tree, home_dir};
 
@@ -19,21 +20,11 @@ pub(crate) fn expand_tilde(s: &str, home: &Path) -> PathBuf {
     }
 }
 
-/// Inverse of `expand_tilde`: re-collapse a `$HOME`-prefixed path back to `~`
-/// so the saved file keeps the user's tilde style.
-pub(crate) fn collapse_tilde(p: &Path, home: &Path) -> String {
-    match p.strip_prefix(home) {
-        Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
-        Ok(rest) => format!("~/{}", rest.display()),
-        Err(_) => p.display().to_string(),
-    }
-}
-
 /// The on-disk layout/config schema (YAML). A flat list of named sections, each
-/// holding named sessions. This is the *typed* shape `serde` (de)serializes; the
-/// in-memory [`Tree`] is built from it (and back). Kept deliberately simple —
-/// two levels (section → session), which is all the UI exposes.
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// holding named sessions. This is the *typed* shape `serde` deserializes; the
+/// in-memory [`Tree`] is built from it. Kept deliberately simple — two levels
+/// (section → session), which is all the UI exposes.
+#[derive(Debug, Default, Deserialize)]
 struct LayoutCfg {
     /// Top-level sections shown in the sidebar, in order.
     #[serde(default)]
@@ -41,29 +32,29 @@ struct LayoutCfg {
 }
 
 /// One sidebar section. May be empty (it still shows as a header).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct GroupCfg {
     name: String,
-    /// Sessions in this section. Omitted in YAML when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Sessions in this section.
+    #[serde(default)]
     sessions: Vec<SessionCfg>,
 }
 
 /// One session (a leaf): a working directory and an optional default command.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct SessionCfg {
     name: String,
     /// Working directory (`~` allowed). Empty/absent → `$HOME`.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     dir: String,
-    /// Default command run by Start. Omitted in YAML when empty (a bare shell).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Default command run by Start. Empty → a bare shell.
+    #[serde(default)]
     command: String,
 }
 
 /// Parse the YAML layout file into a tree. Malformed YAML degrades to an empty
 /// layout rather than panicking. Empty sections are kept (they render as bare
-/// headers). Inverse of [`serialize_workspace`].
+/// headers).
 pub(crate) fn parse_workspace(text: &str, home: &Path) -> Tree {
     let cfg: LayoutCfg = serde_yaml::from_str(text).unwrap_or_default();
 
@@ -96,51 +87,16 @@ pub(crate) fn parse_workspace(text: &str, home: &Path) -> Tree {
     tree
 }
 
-/// Serialize the tree back to the YAML layout file. Inverse of
-/// [`parse_workspace`] (round-trips sections, sessions, workdirs, commands).
-/// Pure; `home` re-collapses absolute workdirs to `~`. Volatile helper tabs
-/// (e.g. the layout-editing nano session) are omitted. Two levels only — a
-/// section's sub-groups (none exist in practice) would be flattened away.
-pub(crate) fn serialize_workspace(tree: &Tree, home: &Path) -> String {
-    let mut cfg = LayoutCfg::default();
-    for &gid in &tree.nodes[tree.root].children {
-        let g = &tree.nodes[gid];
-        if g.volatile || !matches!(g.kind, Kind::Group) {
-            continue;
-        }
-        let mut group = GroupCfg {
-            name: g.name.clone(),
-            sessions: Vec::new(),
-        };
-        for &lid in &g.children {
-            let n = &tree.nodes[lid];
-            if n.volatile {
-                continue; // runtime-only helper tab
-            }
-            if let Kind::Leaf { workdir, command } = &n.kind {
-                group.sessions.push(SessionCfg {
-                    name: n.name.clone(),
-                    dir: collapse_tilde(workdir, home),
-                    command: command.clone(),
-                });
-            }
-        }
-        cfg.groups.push(group);
-    }
-    serde_yaml::to_string(&cfg).unwrap_or_default()
-}
-
 /// Which layout file to use, per the `terms` CLI:
 ///
 /// * `terms <file>` → that file (a leading `~` is expanded; relative paths resolve
-///   against the current directory). Opened if it exists, otherwise created on
-///   first save.
+///   against the current directory).
 /// * `terms` (no argument) → the per-directory layout file `./termset.yml` in the
 ///   current directory — so each project gets its own layout.
 ///
 /// Either way, a missing file just opens the default layout (a `Project` group
-/// with one session in the current directory; see [`default_workspace_text`])
-/// and writes it on first save.
+/// with one session in the current directory; see [`default_workspace_text`]).
+/// The app never writes the file — create or edit it yourself.
 pub(crate) fn resolve_workspace_path() -> PathBuf {
     match std::env::args().nth(1) {
         Some(a) if !a.trim().is_empty() => expand_tilde(a.trim(), &home_dir()),
@@ -159,8 +115,8 @@ const DEFAULT_LAYOUT_TEMPLATE: &str = include_str!("../assets/default-termset.ym
 
 /// The tree a brand-new (missing/empty) workspace opens with: the bundled
 /// [`DEFAULT_LAYOUT_TEMPLATE`] with `{{name}}`/`{{dir}}` filled in for the
-/// current working directory. Nothing is written to disk — this only lives in
-/// memory until the first save.
+/// current working directory. Nothing is written to disk — it only ever lives
+/// in memory.
 pub(crate) fn default_workspace_text() -> String {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let name = cwd

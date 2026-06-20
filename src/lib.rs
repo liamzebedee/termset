@@ -16,7 +16,7 @@
 //!
 //! Run with: `cargo run --release`
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -28,11 +28,12 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Flags, Hyperlink};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions};
 
 use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -420,7 +421,6 @@ enum Shortcut {
     Stop,
     ToggleSidebar,
     EditLayout,
-    SaveLayout,
     Quit,
 }
 
@@ -430,16 +430,16 @@ enum Shortcut {
 /// * **macOS** uses ⌘ (Command), like every native mac app: ⌘C copy, ⌘V paste,
 ///   ⌘T new tab, ⌘W close, ⌘↑/⌘↓ select previous/next tree node, ⌘←/⌘→
 ///   collapse/expand the selected group, ⌘R run/start, ⌘. stop, ⌘B toggle the
-///   sidebar, ⌘, edit layout (the layout file in an editor tab), ⌘S save layout,
-///   ⌘Q quit. ⌘ never collides with the shell's own Ctrl- control codes, so all
+///   sidebar, ⌘, edit layout (the layout file in an editor tab), ⌘Q quit. ⌘
+///   never collides with the shell's own Ctrl- control codes, so all
 ///   of these are safe to claim.
 /// * **Elsewhere** there is no ⌘, so the terminal convention Ctrl+Shift is used
 ///   (plain Ctrl+C etc. must stay free for the shell): Ctrl+Shift+C/V/T/W for
 ///   copy/paste/new/close, Ctrl+Shift+↑/↓ select previous/next node,
 ///   Ctrl+Shift+←/→ collapse/expand the selected group, Ctrl+Shift+B toggle the
 ///   sidebar, Ctrl+Shift+R start, Ctrl+Shift+X stop, Ctrl+Shift+, edit layout,
-///   Ctrl+Shift+S save layout, Ctrl+Shift+Q quit. (Shift+`,` reports as `<` on
-///   many layouts, so both are accepted.)
+///   Ctrl+Shift+Q quit. (Shift+`,` reports as `<` on many layouts, so both are
+///   accepted.)
 fn match_shortcut(mods: ModifiersState, key: &Key) -> Option<Shortcut> {
     let ch = |name: &str| matches!(key, Key::Character(c) if c.eq_ignore_ascii_case(name));
     #[cfg(target_os = "macos")]
@@ -461,7 +461,6 @@ fn match_shortcut(mods: ModifiersState, key: &Key) -> Option<Shortcut> {
             Key::Named(NamedKey::ArrowRight) => Shortcut::Expand,
             _ if ch("b") => Shortcut::ToggleSidebar,
             _ if ch("r") => Shortcut::Start,
-            _ if ch("s") => Shortcut::SaveLayout,
             _ if ch(",") => Shortcut::EditLayout,
             _ if ch("q") => Shortcut::Quit,
             _ => return None,
@@ -483,7 +482,6 @@ fn match_shortcut(mods: ModifiersState, key: &Key) -> Option<Shortcut> {
             Key::Named(NamedKey::ArrowRight) => Shortcut::Expand,
             _ if ch("b") => Shortcut::ToggleSidebar,
             _ if ch("r") => Shortcut::Start,
-            _ if ch("s") => Shortcut::SaveLayout,
             _ if ch("x") => Shortcut::Stop,
             // Shift+`,` is `<` on most layouts; accept either.
             _ if ch(",") || ch("<") => Shortcut::EditLayout,
@@ -656,6 +654,13 @@ enum UserEvent {
     /// Glyph-coverage fonts (emoji + OS CJK/symbol faces) finished loading on a
     /// worker thread — swap them into the renderer so later frames cover more.
     FallbackFonts(Vec<fontdue::Font>),
+    /// Bytes the terminal must write *back* down the PTY in reply to a query
+    /// from the running program (OSC color reports, device-status reports, …).
+    /// `u64` is the owning session id (routed via `id_of`).
+    PtyWrite(u64, Vec<u8>),
+    /// A program asked to put text on the system clipboard (OSC 52 write).
+    /// The clipboard is global, so no session id is needed.
+    ClipboardStore(String),
 }
 
 /// `EventListener` impl handed to `alacritty_terminal`. Forwards the events we
@@ -686,6 +691,25 @@ impl EventListener for Listener {
             }
             TermEvent::Title(t) => proxy.send_event(UserEvent::Title(*id, t)),
             TermEvent::ResetTitle => proxy.send_event(UserEvent::ResetTitle(*id)),
+            // A program queried a terminal color (e.g. OSC 11 background).
+            // Resolve the index against our palette, let the supplied formatter
+            // build the escape reply, and route it back to the PTY. Without
+            // this the query times out and apps assume a light terminal,
+            // emitting dark text that's unreadable over our dark backdrop.
+            TermEvent::ColorRequest(index, formatter) => {
+                let reply = formatter(crate::ui::osc_color(index));
+                proxy.send_event(UserEvent::PtyWrite(*id, reply.into_bytes()))
+            }
+            // Other PTY replies the emulation layer generates (DSR, DA, …).
+            TermEvent::PtyWrite(text) => {
+                proxy.send_event(UserEvent::PtyWrite(*id, text.into_bytes()))
+            }
+            // OSC 52: a program copies to the system clipboard (vim/tmux yank).
+            // Only the *write* is honored; OSC 52 reads are intentionally not
+            // implemented (they let any program exfiltrate the clipboard).
+            TermEvent::ClipboardStore(_, text) => {
+                proxy.send_event(UserEvent::ClipboardStore(text))
+            }
             _ => Ok(()),
         };
     }
@@ -979,6 +1003,9 @@ fn spawn_session(
         HashMap::from([
             ("TERM".to_string(), "xterm-256color".to_string()),
             ("COLORTERM".to_string(), "truecolor".to_string()),
+            // Static "light text on dark background" hint for apps that read
+            // the env var instead of (or before) issuing an OSC 11 query.
+            ("COLORFGBG".to_string(), "15;0".to_string()),
         ])
     };
     let opts = PtyOptions {
@@ -1032,7 +1059,7 @@ fn layout_dir(ws_path: &Path) -> PathBuf {
 /// same place regardless of where `terms` was launched from — and stays portable
 /// when the layout is committed and opened on another machine. Absolute paths
 /// (including `~`-expanded ones) pass through unchanged. The relative form is
-/// kept in the tree, so it round-trips back to the YAML on save.
+/// kept verbatim in the tree (resolution happens only at spawn time).
 fn resolve_workdir(base: &Path, dir: &Path) -> PathBuf {
     if dir.is_absolute() {
         dir.to_path_buf()
@@ -1139,6 +1166,11 @@ struct State {
     /// The sidebar row the pointer is currently over (if any), drawn with a
     /// faint hover fill. `None` when off the tree or over the selected row.
     sidebar_hover: Option<NodeId>,
+    /// Grid cells of the URL under the pointer while Ctrl is held — drawn
+    /// underlined so the link reads as clickable. Empty when no link is
+    /// hovered (or Ctrl is up). Ctrl+click on any of these opens the URL.
+    /// Keyed by `(line, column)` since `Point` itself isn't `Hash`.
+    link_cells: HashSet<(i32, usize)>,
 }
 
 impl State {
@@ -1147,9 +1179,14 @@ impl State {
     /// hit-testing work in these coordinates.
     fn logical_size(&self) -> (usize, usize) {
         let s = self.scale.max(1.0);
+        // Round *up*: the logical→physical upscale maps with the constant device
+        // `scale` (not the `pw/lw` stretch ratio — that drifts per resize step and
+        // makes chrome edges, e.g. the sidebar, wobble), so the logical buffer
+        // must be at least `phys/scale` to fully cover the physical surface with
+        // no uninitialised strip along the right/bottom edge.
         (
-            ((self.phys.0 as f64 / s).round() as usize).max(1),
-            ((self.phys.1 as f64 / s).round() as usize).max(1),
+            ((self.phys.0 as f64 / s).ceil() as usize).max(1),
+            ((self.phys.1 as f64 / s).ceil() as usize).max(1),
         )
     }
 
@@ -1222,6 +1259,7 @@ impl State {
                 cw,
                 ch,
                 FONT_PX,
+                &self.link_cells,
             );
             drop(term);
         } else {
@@ -1332,11 +1370,14 @@ impl State {
             return; // 1×: `paint` already produced native-resolution text
         }
         let Some(node) = self.shown() else { return };
-        let sx = pw as f64 / lw as f64;
-        let sy = ph as f64 / lh as f64;
+        // Map with the constant device scale, not `pw/lw`: the latter drifts each
+        // resize step under fractional DPI and makes the sidebar/header edges
+        // breathe by a pixel. `scale` is fixed, so these boundaries are stable.
+        let sx = self.scale.max(1.0);
+        let sy = sx;
         let origin_x = (self.sidebar_w() as f64 * sx).round() as usize;
         let origin_y = (HEADER_H as f64 * sy).round() as usize;
-        let clip_right = (term_right(lw, self.inspector) as f64 * sx).round() as usize;
+        let clip_right = ((term_right(lw, self.inspector) as f64 * sx).round() as usize).min(pw);
         let cell_w = ((self.renderer.cell_w as f64 * sx).round() as usize).max(1);
         let cell_h = ((self.renderer.cell_h as f64 * sy).round() as usize).max(1);
         let font_px = FONT_PX * sy as f32;
@@ -1367,6 +1408,7 @@ impl State {
             cell_w,
             cell_h,
             font_px,
+            &self.link_cells,
         );
     }
 
@@ -1463,6 +1505,197 @@ impl State {
         let row = rows.get(i)?;
         Some((row.id, row.is_group))
     }
+
+    /// The URL under the pointer, if the pointer is inside the shown terminal's
+    /// viewport and sits on a link. Returns the URL text and the grid cells it
+    /// spans. Does not consider the modifier state — callers gate on Ctrl.
+    fn link_under_cursor(&self) -> Option<(String, Vec<Point>)> {
+        let node = self.shown()?;
+        let (pw, _) = self.logical_size();
+        let sw = self.sidebar_w();
+        let tr = term_right(pw, self.inspector);
+        // Outside the terminal viewport (sidebar, header, inspector): no link.
+        if self.mouse.0 < sw as f64
+            || (self.mouse.0 as usize) >= tr
+            || self.mouse.1 < HEADER_H as f64
+        {
+            return None;
+        }
+        let size = self.sessions[&node].tab.size;
+        let term = self.sessions[&node].tab.term.lock();
+        let (point, _) = self.pixel_to_point(&term, size);
+        url_at(&term, point)
+    }
+
+    /// Recompute the hover link highlight from the current pointer position.
+    /// Returns true if the set of highlighted cells changed (so the caller can
+    /// repaint). The link under the pointer is always underlined — no modifier
+    /// needed; Ctrl is only required to *open* it on click.
+    fn refresh_link_hover(&mut self) -> bool {
+        let cells: HashSet<(i32, usize)> = self
+            .link_under_cursor()
+            .map(|(_, pts)| pts.iter().map(|p| (p.line.0, p.column.0)).collect())
+            .unwrap_or_default();
+        if cells != self.link_cells {
+            self.link_cells = cells;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The cursor shape the pointer's current position calls for: a hand over a
+    /// live (Ctrl-held) link, a resize arrow over a window grip, else the
+    /// default arrow.
+    fn desired_cursor(&self, pw: usize, ph: usize) -> CursorIcon {
+        // A link is always underlined on hover, but the hand cursor only appears
+        // while Ctrl is held — that's the state in which a click opens it.
+        if self.mods.control_key() && !self.link_cells.is_empty() {
+            return CursorIcon::Pointer;
+        }
+        resize_dir(pw, ph, self.mouse.0, self.mouse.1)
+            .map(resize_cursor)
+            .unwrap_or(CursorIcon::Default)
+    }
+
+    /// Push `desired_cursor` to the OS, but only when the shape changes (a
+    /// `set_cursor` per mouse-move is wasteful).
+    fn apply_cursor(&mut self) {
+        let (pw, ph) = self.logical_size();
+        let want = self.desired_cursor(pw, ph);
+        if want != self.cursor {
+            self.cursor = want;
+            if let Some(w) = &self.window {
+                w.set_cursor(want);
+            }
+        }
+    }
+}
+
+/// URL schemes treated as openable links (longest-first so `https://` wins
+/// over the `http://` prefix when both could match at the same spot).
+const URL_SCHEMES: [&str; 4] = ["https://", "http://", "file://", "ftp://"];
+
+/// Characters that may sit inside a URL: anything non-blank. The scheme anchors
+/// the match; the run then extends over every printable cell up to whitespace.
+fn is_url_char(c: char) -> bool {
+    !c.is_whitespace() && c != '\0'
+}
+
+/// Trailing punctuation trimmed off a detected URL — sentence punctuation and
+/// closing brackets that almost always belong to the surrounding prose, not the
+/// link (e.g. `see https://x.com.` or `(https://x.com)`).
+fn is_url_trailer(c: char) -> bool {
+    matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"' | '>')
+}
+
+/// Find the link (if any) under `point` in the terminal grid. Returns the URL
+/// and every grid `Point` it covers (for hover highlighting). Two kinds are
+/// recognized: an explicit OSC 8 hyperlink the cell carries (what Rust's
+/// tooling emits, where the visible text differs from the URL), and a bare URL
+/// typed into the text. Logical lines wrapped across rows are stitched back
+/// together via the `WRAPLINE` flag so a link spilling onto the next row is
+/// still detected as one.
+fn url_at(term: &Term<Listener>, point: Point) -> Option<(String, Vec<Point>)> {
+    let grid = term.grid();
+    let cols = grid.columns();
+    if cols == 0 {
+        return None;
+    }
+    let top = grid.topmost_line().0;
+    let bottom = grid.bottommost_line().0;
+    let last = Column(cols - 1);
+
+    // Walk up to the logical line's first row: a row continues the one above
+    // when that row ends with WRAPLINE.
+    let mut line = point.line.0;
+    while line > top && grid[Line(line - 1)][last].flags.contains(Flags::WRAPLINE) {
+        line -= 1;
+    }
+
+    // Assemble the logical line's text with a parallel cell -> Point map,
+    // following WRAPLINE forward. Wide-char spacers carry no glyph of their own.
+    let mut chars: Vec<char> = Vec::new();
+    let mut points: Vec<Point> = Vec::new();
+    let mut hrefs: Vec<Option<Hyperlink>> = Vec::new();
+    loop {
+        let row = Line(line);
+        for c in 0..cols {
+            let cell = &grid[row][Column(c)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            chars.push(cell.c);
+            points.push(Point::new(row, Column(c)));
+            hrefs.push(cell.hyperlink());
+        }
+        if line < bottom && grid[row][last].flags.contains(Flags::WRAPLINE) {
+            line += 1;
+        } else {
+            break;
+        }
+    }
+
+    let hover = points.iter().position(|&p| p == point)?;
+
+    // An explicit OSC 8 hyperlink wins: highlight the contiguous run of cells
+    // sharing it and open its target URI (not the visible text).
+    if let Some(href) = &hrefs[hover] {
+        let mut start = hover;
+        while start > 0 && hrefs[start - 1].as_ref() == Some(href) {
+            start -= 1;
+        }
+        let mut end = hover + 1;
+        while end < hrefs.len() && hrefs[end].as_ref() == Some(href) {
+            end += 1;
+        }
+        return Some((href.uri().to_string(), points[start..end].to_vec()));
+    }
+
+    // Otherwise look for a bare URL in the text.
+    let (start, end) = find_url(&chars, hover)?;
+    Some((chars[start..end].iter().collect(), points[start..end].to_vec()))
+}
+
+/// Locate the URL covering character index `hover` within `chars`, returning its
+/// `[start, end)` range. A URL is a known scheme followed by a run of non-blank
+/// characters, with trailing prose punctuation trimmed. Pure (no terminal
+/// types) so it can be unit-tested directly.
+fn find_url(chars: &[char], hover: usize) -> Option<(usize, usize)> {
+    let n = chars.len();
+    for scheme in URL_SCHEMES {
+        let s: Vec<char> = scheme.chars().collect();
+        let mut i = 0;
+        while i + s.len() <= n {
+            if chars[i..i + s.len()] == s[..] {
+                // Extend over the URL body, then trim trailing prose punctuation.
+                let mut end = i + s.len();
+                while end < n && is_url_char(chars[end]) {
+                    end += 1;
+                }
+                while end > i + s.len() && is_url_trailer(chars[end - 1]) {
+                    end -= 1;
+                }
+                if (i..end).contains(&hover) {
+                    return Some((i, end));
+                }
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Open a URL in the user's default handler, detached so the terminal never
+/// blocks on it. Best-effort: a missing opener is silently ignored.
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(not(target_os = "macos"))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    let _ = cmd.arg(url).spawn();
 }
 
 struct App {
@@ -1471,8 +1704,8 @@ struct App {
     /// The window's pixel surface. Lives here (not on `State`) so the
     /// headless harness can own a `State` with no surface at all.
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
-    /// Where the workspace tree is loaded from and persisted to (CLI arg, or
-    /// the default `~/.termspace/workspace01`).
+    /// Where the workspace tree is loaded from (CLI arg, or the default
+    /// `~/.termspace/workspace01`). Read-only — the app never writes it back.
     ws_path: PathBuf,
     /// The window is created hidden and revealed once, after the first frame
     /// is presented, so no blank surface flashes on open.
@@ -1638,7 +1871,6 @@ impl App {
         st.tree.nodes[group].expanded = true;
         st.selected = node;
         self.spawn_for(node);
-        self.save_workspace();
         if let Some(st) = &self.state {
             st.request_redraw();
         }
@@ -1692,8 +1924,8 @@ impl App {
     /// Switch to the background layout-editing tab — nano on the config file —
     /// creating it if needed. The terminal equivalent of an editor's ⌘,: there
     /// is no separate settings UI, the YAML file *is* the layout. Edits load on
-    /// the next launch (the running app does not live-apply them); `Ctrl+Shift+S`
-    /// / ⌘S is the inverse (in-memory layout → file).
+    /// the next launch (the running app does not live-apply them, and never
+    /// writes the file back — it is yours to edit).
     fn edit_layout(&mut self) {
         let Some(node) = self.ensure_config_node() else { return };
         if let Some(st) = self.state.as_mut() {
@@ -1728,9 +1960,6 @@ impl App {
             }
         }
         st.request_redraw();
-        if removed {
-            self.save_workspace();
-        }
     }
 
     /// Move the sidebar selection by `delta` visible rows — the keyboard
@@ -1774,6 +2003,22 @@ impl App {
         st.sync_metrics();
         let (lw, lh) = st.logical_size();
         let size = st.grid_size(lw, lh);
+        // Skip the reflow when the cell dimensions are unchanged. A live resize
+        // fires many events for sub-cell drags (and the WM's increment snapping
+        // isn't guaranteed everywhere), but `term.resize` + a `Msg::Resize`
+        // SIGWINCH to every shell is only meaningful when the *grid* actually
+        // grew or shrank. Reflowing on every pixel both burns CPU and churns
+        // terminal content; gate it on a real change. Chrome still repaints via
+        // the caller's `redraw`.
+        if st
+            .sessions
+            .values()
+            .next()
+            .is_some_and(|s| s.tab.size.cols == size.cols && s.tab.size.lines == size.lines)
+        {
+            st.request_redraw();
+            return;
+        }
         let ws = WindowSize {
             num_cols: size.cols as u16,
             num_lines: size.lines as u16,
@@ -1814,18 +2059,8 @@ impl App {
         self.relayout();
     }
 
-    /// Persist the tree to the `workspace` file so new sessions, renamed
-    /// titles and edited commands survive a restart. Best-effort: a write
-    /// failure is non-fatal.
-    fn save_workspace(&self) {
-        if let Some(st) = &self.state {
-            let text = serialize_workspace(&st.tree, &home_dir());
-            let _ = std::fs::write(&self.ws_path, text);
-        }
-    }
-
     /// Pin the selected leaf's default working directory to its session's
-    /// *current* shell cwd (where you've `cd`'d to), then persist.
+    /// *current* shell cwd (where you've `cd`'d to).
     fn use_current_cwd(&mut self) {
         let Some(st) = self.state.as_mut() else { return };
         let sel = st.selected;
@@ -1835,7 +2070,6 @@ impl App {
         if let Some(cwd) = proc_cwd(pid) {
             st.tree.set_workdir(sel, cwd);
             st.request_redraw();
-            self.save_workspace();
         }
     }
 
@@ -1913,7 +2147,6 @@ impl App {
         }
         st.caret = caret;
         st.request_redraw();
-        self.save_workspace();
         true
     }
 
@@ -1970,19 +2203,25 @@ impl App {
             return;
         }
         // Nearest-neighbour upscale of the shape layer (text was captured, not
-        // drawn, so this doesn't blur any glyphs).
+        // drawn, so this doesn't blur any glyphs). Sample by the constant device
+        // `scale`, not the `pw/lw` stretch ratio: the stretch ratio drifts a
+        // fraction of a percent each resize step under fractional DPI, which
+        // jitters every chrome edge (the sidebar's right border most visibly).
+        // `logical_size` rounds up, so `px/scale < lw` always holds — full
+        // coverage, no clamp-induced edge artefact.
+        let s = st.scale.max(1.0);
         for py in 0..ph {
-            let ly = (py * lh / ph).min(lh - 1);
+            let ly = ((py as f64 / s) as usize).min(lh - 1);
             let (srow, drow) = (ly * lw, py * pw);
             for px in 0..pw {
-                let lx = (px * lw / pw).min(lw - 1);
+                let lx = ((px as f64 / s) as usize).min(lw - 1);
                 buf[drow + px] = st.fb[srow + lx];
             }
         }
         // Now render text at true device resolution over the upscaled shapes:
         // the terminal grid first, then the captured chrome strings.
         st.overdraw_terminal_physical(&mut buf[..], pw, ph);
-        let (sx, sy) = (pw as f64 / lw as f64, ph as f64 / lh as f64);
+        let (sx, sy) = (s, s);
         if let Some(cmds) = st.renderer.text_log.take() {
             render_text_cmds(&mut buf[..], pw, ph, &mut st.renderer, cmds, sx, sy);
         }
@@ -2053,7 +2292,7 @@ fn mark_window_opaque(window: &Window) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{
-        AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, PropMode,
+        AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, Gravity, PropMode,
     };
     // `change_property32` lives on a separate helper trait.
     use x11rb::wrapper::ConnectionExt as _;
@@ -2067,12 +2306,22 @@ fn mark_window_opaque(window: &Window) {
     let Ok((conn, _screen)) = x11rb::connect(None) else {
         return;
     };
-    // New/exposed regions (e.g. while growing the window during a resize drag)
-    // clear to the theme background rather than black, so the edge being dragged
-    // doesn't flash a dark band before our next frame lands.
+    // Two attributes that together make a live resize flicker-free:
+    //
+    // - `bit_gravity = NorthWest`: the default is `ForgetGravity`, under which
+    //   the server *discards the whole window and re-fills it with
+    //   `background_pixel` on every ConfigureNotify* — so each drag step flashes
+    //   the entire window to `BG` before our `present()` lands (the "mega
+    //   flicker"). NorthWest keeps the existing pixels anchored top-left; only
+    //   the genuinely-new L-strip along the grown edge is cleared.
+    // - `background_pixel = BG`: that new strip clears to the theme background
+    //   rather than black, so the dragged edge doesn't flash a dark band before
+    //   our next frame overdraws it.
     let _ = conn.change_window_attributes(
         xid,
-        &ChangeWindowAttributesAux::new().background_pixel(BG),
+        &ChangeWindowAttributesAux::new()
+            .bit_gravity(Gravity::NORTH_WEST)
+            .background_pixel(BG),
     );
     // `_NET_WM_OPAQUE_REGION = whole window` → the compositor won't alpha-blend
     // the surface against the desktop, even before we've drawn into it.
@@ -2134,6 +2383,15 @@ impl ApplicationHandler<UserEvent> for App {
         #[cfg(target_os = "linux")]
         mark_window_opaque(&window);
         let renderer = Renderer::new();
+        // Quantize resizing to whole terminal cells: the WM snaps the drag to
+        // multiples of one cell, so the grid is always pixel-exact and we get a
+        // resize event per *cell* crossed rather than per pixel. The fixed chrome
+        // (header/sidebar) is a constant offset, so cell-stepping the window
+        // cell-steps the terminal area too.
+        window.set_resize_increments(Some(LogicalSize::new(
+            renderer.cell_w as f64,
+            renderer.cell_h as f64,
+        )));
         // Load the glyph-coverage fallback fonts off the critical path; they
         // arrive back as `UserEvent::FallbackFonts` once parsed.
         {
@@ -2182,6 +2440,7 @@ impl ApplicationHandler<UserEvent> for App {
             win_hover: None,
             header_hover: false,
             sidebar_hover: None,
+            link_cells: HashSet::new(),
         };
         self.state = Some(st);
 
@@ -2245,7 +2504,6 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Exit(id) => {
-                let mut removed_dynamic = false;
                 if let Some(st) = self.state.as_mut() {
                     if let Some(&node) = st.id_of.get(&id) {
                         if let Some(s) = st.sessions.remove(&node) {
@@ -2255,9 +2513,9 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         st.id_of.remove(&id);
                         // A scratch tab disappears when its shell exits; a
-                        // spec leaf stays so Start can bring it back.
+                        // spec leaf stays so Start can bring it back. The layout
+                        // file is left untouched — the app never writes it.
                         if st.tree.nodes[node].dynamic {
-                            removed_dynamic = true;
                             if let Some(p) = st.tree.nodes[node].parent {
                                 let target = st.tree.prev_sibling(node).unwrap_or(p);
                                 st.tree.nodes[p].children.retain(|&c| c != node);
@@ -2268,9 +2526,6 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         st.request_redraw();
                     }
-                }
-                if removed_dynamic {
-                    self.save_workspace();
                 }
             }
             UserEvent::Title(id, title) => {
@@ -2292,6 +2547,18 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         st.request_redraw();
                     }
+                }
+            }
+            UserEvent::PtyWrite(id, bytes) => {
+                if let Some(node) =
+                    self.state.as_ref().and_then(|st| st.id_of.get(&id).copied())
+                {
+                    self.send_to(node, bytes);
+                }
+            }
+            UserEvent::ClipboardStore(text) => {
+                if let Some(cb) = self.state.as_mut().and_then(|st| st.clipboard.as_mut()) {
+                    let _ = cb.set_text(text);
                 }
             }
             UserEvent::FallbackFonts(fonts) => {
@@ -2326,6 +2593,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ModifiersChanged(m) => {
                 if let Some(st) = self.state.as_mut() {
                     st.mods = m.state();
+                    // The underline doesn't depend on Ctrl, but the hand cursor
+                    // does: pressing/releasing Ctrl over a link swaps the cursor
+                    // without any mouse-move, so refresh it here.
+                    st.apply_cursor();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -2334,20 +2605,16 @@ impl ApplicationHandler<UserEvent> for App {
                     // space, so divide by the scale before hit-testing.
                     let s = st.scale.max(1.0);
                     st.mouse = (position.x / s, position.y / s);
-                    // Show a resize cursor over the window's edge/corner grips
-                    // so the resize affordance is discoverable; fall back to the
-                    // default arrow everywhere else. Only push to the OS when the
-                    // shape changes to avoid a `set_cursor` per mouse-move.
-                    let (pw, ph) = st.logical_size();
-                    let want = resize_dir(pw, ph, st.mouse.0, st.mouse.1)
-                        .map(resize_cursor)
-                        .unwrap_or(CursorIcon::Default);
-                    if want != st.cursor {
-                        st.cursor = want;
-                        if let Some(w) = &st.window {
-                            w.set_cursor(want);
-                        }
+                    let (pw, _ph) = st.logical_size();
+                    // Ctrl+hover link highlight: recompute the underlined link
+                    // under the new pointer position and repaint if it changed.
+                    if st.refresh_link_hover() {
+                        st.request_redraw();
                     }
+                    // Cursor shape: a hand over a live link, a resize arrow over
+                    // the window's edge/corner grips, the default arrow else.
+                    // Only pushed to the OS when the shape actually changes.
+                    st.apply_cursor();
                     // Traffic-light hover: reveal the dots' glyphs while the
                     // pointer is over any of them. Repaint only on a change.
                     let hover = win_btns(pw)
@@ -2503,7 +2770,19 @@ impl ApplicationHandler<UserEvent> for App {
                             st.request_redraw();
                             return;
                         }
-                        // 7. Terminal area: start a text selection.
+                        // 7. Ctrl+click on a hovered link opens it (and does not
+                        // start a selection). The link set is kept current by the
+                        // Ctrl+hover tracking above.
+                        {
+                            let st = self.state.as_ref().unwrap();
+                            if st.mods.control_key() && !st.link_cells.is_empty() {
+                                if let Some((url, _)) = st.link_under_cursor() {
+                                    open_url(&url);
+                                    return;
+                                }
+                            }
+                        }
+                        // 8. Terminal area: start a text selection.
                         let tr = term_right(pw, self.state.as_ref().unwrap().inspector);
                         let sw = self.state.as_ref().unwrap().sidebar_w();
                         if mx >= sw as f64
@@ -2635,12 +2914,6 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         Shortcut::ToggleSidebar => self.toggle_sidebar(),
                         Shortcut::EditLayout => self.edit_layout(),
-                        Shortcut::SaveLayout => {
-                            self.save_workspace();
-                            if let Some(st) = &self.state {
-                                st.request_redraw();
-                            }
-                        }
                         Shortcut::Quit => event_loop.exit(),
                     }
                     return;
@@ -2754,9 +3027,38 @@ pub fn run() {
 mod tests {
     use super::*;
 
-    // A fixed fixture in the YAML layout format. Tests must not depend on the
-    // live layout file — the app rewrites it (persisted sessions, edits), so
-    // coupling tests to it makes them flaky.
+    fn url_in(line: &str, hover_on: &str) -> Option<String> {
+        let chars: Vec<char> = line.chars().collect();
+        let hover = line.find(hover_on).unwrap();
+        find_url(&chars, hover).map(|(a, b)| chars[a..b].iter().collect())
+    }
+
+    #[test]
+    fn detects_urls_under_the_pointer() {
+        // Plain link, hovering anywhere inside it.
+        assert_eq!(
+            url_in("see https://example.com/x for more", "example"),
+            Some("https://example.com/x".to_string())
+        );
+        // Trailing sentence punctuation and wrapping brackets are trimmed.
+        assert_eq!(
+            url_in("(visit http://a.b/c).", "a.b"),
+            Some("http://a.b/c".to_string())
+        );
+        // file:// scheme is recognized too.
+        assert_eq!(
+            url_in("open file:///etc/hosts now", "etc"),
+            Some("file:///etc/hosts".to_string())
+        );
+        // Hovering off the link (on surrounding prose) finds nothing.
+        assert_eq!(url_in("see https://example.com here", "here"), None);
+        // No scheme, no link.
+        assert_eq!(url_in("just example.com text", "example"), None);
+    }
+
+    // A fixed fixture in the YAML layout format. Tests must not depend on a
+    // real on-disk layout file (a user could edit it at any time), so coupling
+    // tests to it makes them flaky.
     const FIXTURE: &str = "\
 groups:
   - name: Apps
@@ -2848,9 +3150,9 @@ groups:
     }
 
     #[test]
-    fn relative_dir_round_trips_through_yaml() {
-        // A relative `dir` parses as-is and survives a save → reload, so the
-        // portable `../filex` form is never rewritten to an absolute path.
+    fn relative_dir_parses_as_is() {
+        // A relative `dir` parses as-is — the portable `../filex` form is never
+        // rewritten to an absolute path.
         let home = Path::new("/home/u");
         let t = parse_workspace(
             "groups:\n  - name: P\n    sessions:\n      - name: s\n        dir: ../filex\n",
@@ -2858,9 +3160,6 @@ groups:
         );
         let leaf = t.leaves(t.root)[0];
         assert_eq!(t.leaf_spec(leaf).unwrap().0, Path::new("../filex"));
-        let reloaded = parse_workspace(&serialize_workspace(&t, home), home);
-        let rleaf = reloaded.leaves(reloaded.root)[0];
-        assert_eq!(reloaded.leaf_spec(rleaf).unwrap().0, Path::new("../filex"));
     }
 
     #[test]
@@ -2984,86 +3283,14 @@ groups:
         assert_eq!(t.field_text(music, Field::Command), None);
         assert_eq!(t.field_text(music, Field::Dir), None);
 
-        // Editing the directory field round-trips back into the tree and the
-        // saved file (a typed leading `~` expands on commit).
+        // Editing the directory field writes straight back into the tree (a
+        // typed leading `~` expands on commit).
         let mut t = t;
         t.set_workdir(leaf, expand_tilde("~/elsewhere", Path::new("/home/u")));
         assert_eq!(
             t.field_text(leaf, Field::Dir).as_deref(),
             Some("/home/u/elsewhere")
         );
-        let reloaded =
-            parse_workspace(&serialize_workspace(&t, Path::new("/home/u")), Path::new("/home/u"));
-        let rleaf = reloaded.leaves(group(&reloaded, "Music"))[0];
-        assert_eq!(reloaded.leaf_spec(rleaf).unwrap().0, Path::new("/home/u/elsewhere"));
-    }
-
-    /// Flatten the tree to a comparable shape: (depth, name, kind, workdir,
-    /// command) per node in DFS order.
-    fn shape(t: &Tree, home: &Path) -> Vec<(usize, String, &'static str, String, String)> {
-        fn go(
-            t: &Tree,
-            id: NodeId,
-            d: usize,
-            home: &Path,
-            out: &mut Vec<(usize, String, &'static str, String, String)>,
-        ) {
-            for &c in &t.nodes[id].children {
-                let n = &t.nodes[c];
-                let row = match &n.kind {
-                    Kind::Group => (d, n.name.clone(), "g", String::new(), String::new()),
-                    Kind::Leaf { workdir, command } => (
-                        d,
-                        n.name.clone(),
-                        "l",
-                        collapse_tilde(workdir, home),
-                        command.clone(),
-                    ),
-                    Kind::Root => continue,
-                };
-                out.push(row);
-                go(t, c, d + 1, home, out);
-            }
-        }
-        let mut v = Vec::new();
-        go(t, t.root, 0, home, &mut v);
-        v
-    }
-
-    #[test]
-    fn workspace_round_trips_through_disk_format() {
-        let home = Path::new("/home/u");
-        let t1 = parse_workspace(FIXTURE, home);
-        let text = serialize_workspace(&t1, home);
-        let t2 = parse_workspace(&text, home);
-        // Re-parsing the serialized YAML yields the same tree.
-        assert_eq!(shape(&t1, home), shape(&t2, home));
-    }
-
-    #[test]
-    fn saved_scratch_session_reloads_as_a_leaf() {
-        // A new scratch tab has an empty command; it must come back as a
-        // leaf (with its cwd), not get misread as a group.
-        let home = Path::new("/home/u");
-        let mut t = parse_workspace("groups:\n  - name: Scratch\n", home);
-        let scratch = group(&t, "Scratch");
-        t.push(
-            Some(scratch),
-            "Scratch 1".into(),
-            Kind::Leaf {
-                workdir: PathBuf::from("/home/u/work"),
-                command: String::new(),
-            },
-            true,
-        );
-        let reloaded = parse_workspace(&serialize_workspace(&t, home), home);
-        let s = group(&reloaded, "Scratch");
-        let leaves = reloaded.leaves(s);
-        assert_eq!(leaves.len(), 1);
-        let (wd, cmd) = reloaded.leaf_spec(leaves[0]).unwrap();
-        assert_eq!(reloaded.nodes[leaves[0]].name, "Scratch 1");
-        assert_eq!(wd, Path::new("/home/u/work"));
-        assert_eq!(cmd, "");
     }
 
     #[test]
@@ -3120,14 +3347,16 @@ groups:
             // ⌘ is the mac modifier; Ctrl+Shift is not.
             assert_eq!(match_shortcut(cmd, &c), Some(Shortcut::Copy));
             assert_eq!(match_shortcut(cmd, &dot), Some(Shortcut::Stop));
-            assert_eq!(match_shortcut(cmd, &s), Some(Shortcut::SaveLayout));
+            // ⌘S is unbound — the layout is never saved by the app.
+            assert_eq!(match_shortcut(cmd, &s), None);
             assert_eq!(match_shortcut(cmd, &comma), Some(Shortcut::EditLayout));
             assert_eq!(match_shortcut(cmd, &q), Some(Shortcut::Quit));
             assert_eq!(match_shortcut(ctrl_shift, &c), None);
         } else {
             // Ctrl+Shift is the modifier elsewhere; ⌘ doesn't exist.
             assert_eq!(match_shortcut(ctrl_shift, &c), Some(Shortcut::Copy));
-            assert_eq!(match_shortcut(ctrl_shift, &s), Some(Shortcut::SaveLayout));
+            // Ctrl+Shift+S is unbound — the layout is never saved by the app.
+            assert_eq!(match_shortcut(ctrl_shift, &s), None);
             assert_eq!(match_shortcut(ctrl_shift, &q), Some(Shortcut::Quit));
             // Both `,` and its shifted `<` edit the layout.
             assert_eq!(match_shortcut(ctrl_shift, &comma), Some(Shortcut::EditLayout));

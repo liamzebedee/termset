@@ -3,9 +3,11 @@
 //! inspector, context menu, buttons, fields) and the chrome geometry/hit-test
 //! helpers shared by draw and click handling.
 
+use std::collections::HashSet;
+
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::vte::ansi::{Color, NamedColor};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
 use winit::window::{CursorIcon, ResizeDirection};
 
@@ -20,6 +22,9 @@ pub(crate) const FG: u32 = 0xea_ea_ea; // terminal default text (white)
 // cell is *explicitly* filled with the default bg, so it's a dark teal that
 // blends with the image.
 pub(crate) const BG: u32 = 0x0b_1d_1d;
+// Ctrl+hover link affordance: the hovered URL's cells get a bright blue
+// underline so it reads as clickable.
+pub(crate) const LINK: u32 = 0x5c_9c_ff;
 pub(crate) const SEL: u32 = 0x2f_5d_6e; // selection fill (white text stays readable)
 pub(crate) const HOVER: u32 = 0x1c_1c_1c; // sidebar row hover fill (a hair above STRIP_BG; text stays readable)
 
@@ -41,6 +46,12 @@ pub(crate) const TLIGHT_CELL: usize = 18; // per-dot hit cell for the window con
 pub(crate) const TLIGHT_R: f32 = 5.0; // traffic-light dot radius (px); diameter 10 in a 16px row
 pub(crate) const EDGE: f64 = 9.0; // borderless-window resize-grip thickness (edges)
 pub(crate) const CORNER: f64 = 22.0; // larger square grab zone at each window corner
+
+// Scrollback indicator: a thin, semi-transparent bar at the right edge of the
+// terminal viewport. Sizes are logical (1×); the Retina pass scales them.
+pub(crate) const SBAR_W: usize = 4; // thumb/track width
+pub(crate) const SBAR_PAD: usize = 2; // inset from the viewport's right edge
+pub(crate) const SBAR_MIN: usize = 16; // minimum thumb height so it stays grabbable
 
 // macOS-style "traffic light" window controls (bitmap dots, not glyphs).
 pub(crate) const TLIGHT_MIN: u32 = 0xfe_bc_2e; // minimize — amber
@@ -70,6 +81,23 @@ pub(crate) fn rgb(color: Color, default: u32) -> u32 {
 
 pub(crate) fn pack(r: u8, g: u8, b: u8) -> u32 {
     (r as u32) << 16 | (g as u32) << 8 | b as u32
+}
+
+/// Resolve a color *index* (as carried by `alacritty_terminal`'s
+/// `Event::ColorRequest`) to its actual RGB, so OSC 10/11/4 queries can be
+/// answered. Indices 0..=255 are the palette; 256/257/258 are the special
+/// foreground/background/cursor colors (see `vte::ansi::NamedColor`). Reporting
+/// our real dark `BG` is what lets apps (e.g. Claude Code) detect a dark
+/// terminal and emit light, readable text over the backdrop image.
+pub(crate) fn osc_color(index: usize) -> Rgb {
+    let packed = match index {
+        0..=255 => indexed_rgb(index as u8),
+        256 => FG, // NamedColor::Foreground
+        257 => BG, // NamedColor::Background
+        258 => FG, // NamedColor::Cursor (drawn in the default ink)
+        _ => FG,
+    };
+    Rgb { r: (packed >> 16) as u8, g: (packed >> 8) as u8, b: packed as u8 }
 }
 
 // ANSI palette tuned for the **dark** backdrop: bright, saturated hues that pop
@@ -459,6 +487,7 @@ pub(crate) fn draw_terminal_cells(
     cell_w: usize,
     cell_h: usize,
     font_px: f32,
+    links: &HashSet<(i32, usize)>,
 ) {
     // `display_iter` numbers scrollback with negative grid lines; the visible
     // viewport is shifted by the scroll offset, so a grid line maps to on-screen
@@ -533,6 +562,12 @@ pub(crate) fn draw_terminal_cells(
             let sy = y0 + cell_h / 2;
             hline(buf, bw, bh, x0, sy, span, clip_right, thick, fg);
         }
+        // Ctrl+hover link: underline the URL's cells in the link colour so the
+        // pointer's blue underline tracks the link under the cursor.
+        if !links.is_empty() && links.contains(&(cell.point.line.0, cell.point.column.0)) {
+            let uy = y0 + cell_h.saturating_sub(thick + 1);
+            hline(buf, bw, bh, x0, uy, span, clip_right, thick, LINK);
+        }
     }
 }
 
@@ -554,6 +589,52 @@ pub(crate) fn hline(
             buf[yy * bw + xx] = color;
         }
     }
+}
+
+/// Fill a rect by alpha-blending `color` over what's already in `buf` (clipped).
+/// Used for the translucent scrollbar so the backdrop reads through it.
+pub(crate) fn blend_rect(buf: &mut [u32], pw: usize, ph: usize, x: usize, y: usize, w: usize, h: usize, color: u32, a: u32) {
+    for yy in y..(y + h).min(ph) {
+        for xx in x..(x + w).min(pw) {
+            let idx = yy * pw + xx;
+            buf[idx] = blend(color, buf[idx], a);
+        }
+    }
+}
+
+/// A minimal scrollback indicator at the right edge of the terminal viewport: a
+/// barely-there full-height track with a brighter thumb whose size and position
+/// come from the grid's scrollback. Geometry is in *target* pixels (like
+/// [`draw_terminal_cells`]) so the same routine serves the logical compose and
+/// the crisp Retina overdraw — pass `thick`/`pad`/`min_thumb` already scaled.
+/// Draws nothing when there's no scrollback (`history == 0`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_scrollbar(
+    buf: &mut [u32],
+    bw: usize,
+    bh: usize,
+    area_y: usize,
+    area_right: usize,
+    area_h: usize,
+    thick: usize,
+    pad: usize,
+    min_thumb: usize,
+    offset: usize,
+    history: usize,
+    screen: usize,
+) {
+    if history == 0 || screen == 0 || area_h == 0 || thick == 0 {
+        return;
+    }
+    let total = history + screen;
+    let x = area_right.saturating_sub(thick + pad);
+    // Faint guide so the thumb reads as a track, not a floating sliver.
+    blend_rect(buf, bw, bh, x, area_y, thick, area_h, 0xff_ff_ff, 16);
+    // Thumb height = fraction of content on screen; position = scroll offset,
+    // where `offset == history` is the top and `offset == 0` is the bottom.
+    let thumb_h = (area_h * screen / total).max(min_thumb).min(area_h);
+    let top = area_y + (area_h - thumb_h) * (history - offset) / history;
+    blend_rect(buf, bw, bh, x, top, thick, thumb_h, 0xff_ff_ff, 96);
 }
 
 /// The left tree pane, rendered as plain monospace text on the terminal's own
