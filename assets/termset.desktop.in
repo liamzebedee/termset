@@ -1,0 +1,25 @@
+# Launcher entry template for termset, installed by scripts/install-icon.sh.
+#
+# The script substitutes the @PLACEHOLDERS@ below and writes the result to
+#   ~/.local/share/applications/termset.desktop
+# Edit this file (not the script) to change the launcher.
+#
+#   @BIN@        absolute path to the built `terms` binary
+#   @WORKSPACE@  layout file the launcher opens (the $WORKSPACE var in the script)
+#   @PATH@       working directory the app starts in
+#
+# StartupWMClass must stay `termset`: the app sets that as its X11 WM class /
+# Wayland app_id, so the dock binds this icon to the running window.
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=termset
+GenericName=Workspace Terminal
+Comment=Save your terminal layouts
+Exec=@BIN@ @WORKSPACE@
+Path=@PATH@
+Icon=termset
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupWMClass=termset
+StartupNotify=true

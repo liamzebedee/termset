@@ -1078,30 +1078,43 @@ struct Session {
 // shell — window state and the winit application
 // ===========================================================================
 
-/// State of an open right-click menu: where it was opened and on which node.
-/// What a right-click context menu offers. Both kinds have exactly two items.
+/// A single entry in a right-click context menu, carrying the action it fires.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CtxKind {
-    /// On a sidebar session/section: Start / Stop.
-    Session,
-    /// In the terminal area: Copy / Paste.
-    Edit,
+enum CtxAction {
+    /// Sidebar: start / stop the right-clicked node's session.
+    Start,
+    Stop,
+    /// Terminal: copy the selection / paste the clipboard.
+    Copy,
+    Paste,
+    /// Terminal: open the link under the pointer in the default browser.
+    OpenLink,
+    /// Terminal: web-search the selection (or word under the pointer).
+    SearchGoogle,
 }
 
-impl CtxKind {
-    fn items(self) -> [&'static str; 2] {
+impl CtxAction {
+    fn label(self) -> &'static str {
         match self {
-            CtxKind::Session => ["Start", "Stop"],
-            CtxKind::Edit => ["Copy", "Paste"],
+            CtxAction::Start => "Start",
+            CtxAction::Stop => "Stop",
+            CtxAction::Copy => "Copy",
+            CtxAction::Paste => "Paste",
+            CtxAction::OpenLink => "Open Link",
+            CtxAction::SearchGoogle => "Search Google",
         }
     }
 }
 
+/// State of an open right-click menu: where it was opened, on which node, and the
+/// items it offers. `target` carries the URL (for `OpenLink`) or search text (for
+/// `SearchGoogle`) captured when the menu opened.
 struct CtxMenu {
     x: usize,
     y: usize,
     node: NodeId,
-    kind: CtxKind,
+    items: Vec<CtxAction>,
+    target: Option<String>,
 }
 
 /// Everything that exists once the window is created — or, headlessly, once
@@ -1377,7 +1390,8 @@ impl State {
         // --- context menu ---------------------------------------------------
         if let Some(m) = &self.ctx {
             let hov = ctx_item_at(m, self.mouse.0, self.mouse.1);
-            draw_ctx_menu(&mut buf, pw, ph, &mut self.renderer, m.x, m.y, m.kind.items(), hov);
+            let labels: Vec<&str> = m.items.iter().map(|a| a.label()).collect();
+            draw_ctx_menu(&mut buf, pw, ph, &mut self.renderer, m.x, m.y, &labels, hov);
         }
 
         self.fb = buf;
@@ -1621,6 +1635,23 @@ impl State {
         url_at(&term, point)
     }
 
+    /// Text to offer "Search Google" on: the active selection if there is one,
+    /// otherwise the whitespace-delimited word under the pointer. `None` when
+    /// neither yields anything (e.g. the pointer sits on blank cells).
+    fn search_target(&self) -> Option<String> {
+        let node = self.shown()?;
+        let size = self.sessions[&node].tab.size;
+        let term = self.sessions[&node].tab.term.lock();
+        if let Some(sel) = term.selection_to_string() {
+            let sel = sel.trim();
+            if !sel.is_empty() {
+                return Some(sel.to_string());
+            }
+        }
+        let (point, _) = self.pixel_to_point(&term, size);
+        word_at(&term, point)
+    }
+
     /// Recompute the hover link highlight from the current pointer position.
     /// Returns true if the set of highlighted cells changed (so the caller can
     /// repaint). The link under the pointer is always underlined — no modifier
@@ -1683,14 +1714,15 @@ fn is_url_trailer(c: char) -> bool {
     matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"' | '>')
 }
 
-/// Find the link (if any) under `point` in the terminal grid. Returns the URL
-/// and every grid `Point` it covers (for hover highlighting). Two kinds are
-/// recognized: an explicit OSC 8 hyperlink the cell carries (what Rust's
-/// tooling emits, where the visible text differs from the URL), and a bare URL
-/// typed into the text. Logical lines wrapped across rows are stitched back
-/// together via the `WRAPLINE` flag so a link spilling onto the next row is
-/// still detected as one.
-fn url_at(term: &Term<Listener>, point: Point) -> Option<(String, Vec<Point>)> {
+/// Assemble the full logical line `point` sits on, following the `WRAPLINE`
+/// flag so a line spilling across rows is stitched back together. Returns the
+/// visible chars, a parallel cell -> `Point` map, the per-char OSC 8 hyperlink,
+/// and the index of `point` within them. Wide-char spacers carry no glyph and
+/// are skipped. `None` if the grid is empty or `point` isn't on it.
+fn logical_line(
+    term: &Term<Listener>,
+    point: Point,
+) -> Option<(Vec<char>, Vec<Point>, Vec<Option<Hyperlink>>, usize)> {
     let grid = term.grid();
     let cols = grid.columns();
     if cols == 0 {
@@ -1707,8 +1739,6 @@ fn url_at(term: &Term<Listener>, point: Point) -> Option<(String, Vec<Point>)> {
         line -= 1;
     }
 
-    // Assemble the logical line's text with a parallel cell -> Point map,
-    // following WRAPLINE forward. Wide-char spacers carry no glyph of their own.
     let mut chars: Vec<char> = Vec::new();
     let mut points: Vec<Point> = Vec::new();
     let mut hrefs: Vec<Option<Hyperlink>> = Vec::new();
@@ -1731,6 +1761,39 @@ fn url_at(term: &Term<Listener>, point: Point) -> Option<(String, Vec<Point>)> {
     }
 
     let hover = points.iter().position(|&p| p == point)?;
+    Some((chars, points, hrefs, hover))
+}
+
+/// The whitespace-delimited word under `point`, or `None` when the pointer sits
+/// on a blank cell. Used for "Search Google" when there's no active selection.
+fn word_at(term: &Term<Listener>, point: Point) -> Option<String> {
+    let (chars, _, _, hover) = logical_line(term, point)?;
+    if chars[hover].is_whitespace() || chars[hover] == '\0' {
+        return None;
+    }
+    let blank = |c: char| c.is_whitespace() || c == '\0';
+    let mut start = hover;
+    while start > 0 && !blank(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = hover + 1;
+    while end < chars.len() && !blank(chars[end]) {
+        end += 1;
+    }
+    let word: String = chars[start..end].iter().collect();
+    let word = word.trim().to_string();
+    (!word.is_empty()).then_some(word)
+}
+
+/// Find the link (if any) under `point` in the terminal grid. Returns the URL
+/// and every grid `Point` it covers (for hover highlighting). Two kinds are
+/// recognized: an explicit OSC 8 hyperlink the cell carries (what Rust's
+/// tooling emits, where the visible text differs from the URL), and a bare URL
+/// typed into the text. Logical lines wrapped across rows are stitched back
+/// together via the `WRAPLINE` flag so a link spilling onto the next row is
+/// still detected as one.
+fn url_at(term: &Term<Listener>, point: Point) -> Option<(String, Vec<Point>)> {
+    let (chars, points, hrefs, hover) = logical_line(term, point)?;
 
     // An explicit OSC 8 hyperlink wins: highlight the contiguous run of cells
     // sharing it and open its target URI (not the visible text).
@@ -1790,6 +1853,26 @@ fn open_url(url: &str) {
     #[cfg(not(target_os = "macos"))]
     let mut cmd = std::process::Command::new("xdg-open");
     let _ = cmd.arg(url).spawn();
+}
+
+/// Open a Google web search for `query` in the user's default browser.
+fn open_search(query: &str) {
+    open_url(&format!("https://www.google.com/search?q={}", urlencode(query)));
+}
+
+/// Percent-encode `s` for use in a URL query (RFC 3986 unreserved set kept
+/// literal, everything else `%XX`). Spaces become `%20`.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 struct App {
@@ -2771,15 +2854,26 @@ impl ApplicationHandler<UserEvent> for App {
 
                         // 1. A click anywhere resolves an open context menu.
                         if let Some(m) = &self.state.as_ref().unwrap().ctx {
-                            let pick = ctx_item_at(m, mx, my);
-                            let (node, kind) = (m.node, m.kind);
+                            let pick = ctx_item_at(m, mx, my).map(|i| m.items[i]);
+                            let node = m.node;
+                            let target = m.target.clone();
                             self.state.as_mut().unwrap().ctx = None;
-                            match (kind, pick) {
-                                (CtxKind::Session, Some(0)) => self.start(node),
-                                (CtxKind::Session, Some(1)) => self.stop(node),
-                                (CtxKind::Edit, Some(0)) => self.copy_to_clipboard(),
-                                (CtxKind::Edit, Some(1)) => self.paste(),
-                                _ => {}
+                            match pick {
+                                Some(CtxAction::Start) => self.start(node),
+                                Some(CtxAction::Stop) => self.stop(node),
+                                Some(CtxAction::Copy) => self.copy_to_clipboard(),
+                                Some(CtxAction::Paste) => self.paste(),
+                                Some(CtxAction::OpenLink) => {
+                                    if let Some(url) = target {
+                                        open_url(&url);
+                                    }
+                                }
+                                Some(CtxAction::SearchGoogle) => {
+                                    if let Some(q) = target {
+                                        open_search(&q);
+                                    }
+                                }
+                                None => {}
                             }
                             if let Some(st) = &self.state {
                                 st.request_redraw();
@@ -2969,18 +3063,35 @@ impl ApplicationHandler<UserEvent> for App {
                                 x: (mx as usize).min(sw),
                                 y: my as usize,
                                 node,
-                                kind: CtxKind::Session,
+                                items: vec![CtxAction::Start, CtxAction::Stop],
+                                target: None,
                             });
                             st.request_redraw();
                         } else if mx >= sw as f64 && (mx as usize) < tr && my >= HEADER_H as f64 {
-                            // Terminal area: Copy / Paste.
+                            // Terminal area. A link under the pointer offers
+                            // "Open Link"; otherwise plain text offers a web
+                            // search of the selection (or word under the pointer).
                             let st = self.state.as_mut().unwrap();
                             let node = st.selected;
+                            let (items, target) = if let Some((url, _)) = st.link_under_cursor() {
+                                (
+                                    vec![CtxAction::OpenLink, CtxAction::Copy, CtxAction::Paste],
+                                    Some(url),
+                                )
+                            } else {
+                                let q = st.search_target();
+                                let mut items = vec![CtxAction::Copy, CtxAction::Paste];
+                                if q.is_some() {
+                                    items.push(CtxAction::SearchGoogle);
+                                }
+                                (items, q)
+                            };
                             st.ctx = Some(CtxMenu {
                                 x: (mx as usize).min(pw.saturating_sub(CTX_W)),
                                 y: my as usize,
                                 node,
-                                kind: CtxKind::Edit,
+                                items,
+                                target,
                             });
                             st.request_redraw();
                         } else if let Some(st) = self.state.as_mut() {
@@ -3185,6 +3296,14 @@ mod tests {
         assert_eq!(url_in("see https://example.com here", "here"), None);
         // No scheme, no link.
         assert_eq!(url_in("just example.com text", "example"), None);
+    }
+
+    #[test]
+    fn urlencode_keeps_unreserved_and_escapes_the_rest() {
+        assert_eq!(urlencode("hello world"), "hello%20world");
+        assert_eq!(urlencode("a-b_c.d~e"), "a-b_c.d~e");
+        assert_eq!(urlencode("cargo build --release"), "cargo%20build%20--release");
+        assert_eq!(urlencode("a+b&c=d"), "a%2Bb%26c%3Dd");
     }
 
     // A fixed fixture in the YAML layout format. Tests must not depend on a

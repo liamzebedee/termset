@@ -8,15 +8,27 @@
 #   ~/.local/share/icons/hicolor/scalable/apps/termset.svg   (+ PNG sizes)
 #   ~/.local/share/applications/termset.desktop
 #
-# The .desktop sets StartupWMClass=termset, which the app sets as its X11
-# WM class / Wayland app_id (see src/main.rs), so the dock/launcher icon
-# binds to the running window.
+# The assets it installs live OUTSIDE this script so you can edit them directly:
+#   termset.svg                  — the icon artwork (also used in the README)
+#   assets/termset.desktop.in    — the launcher entry template (@PLACEHOLDERS@)
+#
+# The launcher opens $WORKSPACE (default ~/workspace01.yml) — your "home"
+# workspace. Override it with WORKSPACE=… ./scripts/install-icon.sh, or just
+# edit the file once it's been seeded.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "$SCRIPT_DIR")"
 BIN="$REPO/target/release/terms"
+
+# Editable assets, kept as files rather than inlined heredocs.
+SVG_SRC="$REPO/termset.svg"
+DESKTOP_TEMPLATE="$REPO/assets/termset.desktop.in"
+
+# The workspace the launcher opens. A missing file just opens the default
+# layout, but we seed it below so the icon always lands on a real workspace.
+WORKSPACE="${WORKSPACE:-$HOME/.terms/workspace01.yaml}"
 
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 ICON_BASE="$DATA/icons/hicolor"
@@ -25,6 +37,9 @@ DESKTOP="$APPS/termset.desktop"
 
 log() { printf '  %s\n' "$*"; }
 
+[ -f "$SVG_SRC" ]          || { echo "error: icon $SVG_SRC not found" >&2; exit 1; }
+[ -f "$DESKTOP_TEMPLATE" ] || { echo "error: template $DESKTOP_TEMPLATE not found" >&2; exit 1; }
+
 # 1. Ensure the release binary exists (build if needed).
 if [ ! -x "$BIN" ]; then
     log "building release binary…"
@@ -32,49 +47,10 @@ if [ ! -x "$BIN" ]; then
 fi
 [ -x "$BIN" ] || { echo "error: $BIN not found after build" >&2; exit 1; }
 
-# 2. Write the icon as SVG (scalable). It mirrors the actual UI: a
-#    borderless Win2k window — left tree sidebar with the info square,
-#    a gradient title bar, and a terminal with run markers + cursor.
+# 2. Install the icon SVG (scalable) by copying the editable source in place.
 mkdir -p "$ICON_BASE/scalable/apps"
 SVG="$ICON_BASE/scalable/apps/termset.svg"
-cat > "$SVG" <<'SVG'
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
-  <defs>
-    <!-- Dark-green terminal vignette (matches our prompt background) -->
-    <radialGradient id="bgr" cx="50%" cy="42%" r="75%">
-      <stop offset="0%"  stop-color="#3a7361"/>
-      <stop offset="60%" stop-color="#244a3e"/>
-      <stop offset="100%" stop-color="#15241d"/>
-    </radialGradient>
-    <!-- Light-blue powerline prompt -->
-    <linearGradient id="prompt" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%"   stop-color="#a9dcf7"/>
-      <stop offset="100%" stop-color="#6cb6e6"/>
-    </linearGradient>
-    <!-- Top sheen -->
-    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%"   stop-color="#ffffff" stop-opacity="0.16"/>
-      <stop offset="14%"  stop-color="#ffffff" stop-opacity="0"/>
-    </linearGradient>
-  </defs>
-
-  <!-- Rounded terminal body -->
-  <rect x="20" y="20" width="216" height="216" rx="46" fill="url(#bgr)"/>
-  <rect x="20" y="20" width="216" height="216" rx="46" fill="url(#sheen)"/>
-  <!-- Inner edge for a touch of depth -->
-  <rect x="20.5" y="20.5" width="215" height="215" rx="45.5"
-        fill="none" stroke="#000000" stroke-opacity="0.30" stroke-width="1"/>
-  <rect x="22.5" y="22.5" width="211" height="211" rx="44"
-        fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="1"/>
-
-  <!-- >_  light-blue powerline prompt -->
-  <g fill="none" stroke="url(#prompt)" stroke-width="20"
-     stroke-linecap="round" stroke-linejoin="round">
-    <polyline points="84,92 128,131 84,170"/>
-  </g>
-  <rect x="132" y="158" width="56" height="18" rx="9" fill="url(#prompt)"/>
-</svg>
-SVG
+cp "$SVG_SRC" "$SVG"
 log "icon  -> $SVG"
 
 # 3. Rasterize a few PNG sizes too, if a converter is available (optional;
@@ -92,28 +68,31 @@ rasterize() {
 }
 for s in 48 64 128 256; do rasterize "$s" || { log "(no SVG rasterizer; SVG only)"; break; }; done
 
-# 4. Desktop entry. Path= so the app's ./workspace resolves to this repo;
-#    StartupWMClass binds the launcher icon to the live window.
+# 4. Seed the home workspace if it doesn't exist yet, so the launcher opens a
+#    real layout (the bundled default template, with placeholders filled in).
+if [ ! -e "$WORKSPACE" ]; then
+    mkdir -p "$(dirname "$WORKSPACE")"
+    name="$(basename "${WORKSPACE%.*}")"
+    { printf '# %s — edit freely; the termset launcher opens this file.\n' "$name"
+      grep -v '^#' "$REPO/assets/default-termset.yml" \
+        | sed -e "s|{{name}}|$name|g" -e "s|{{dir}}|$HOME|g"
+    } > "$WORKSPACE"
+    log "workspace seeded -> $WORKSPACE"
+else
+    log "workspace -> $WORKSPACE (kept)"
+fi
+
+# 5. Desktop entry, rendered from assets/termset.desktop.in. Path= so the app's
+#    relative paths resolve under $HOME; Exec opens $WORKSPACE.
 mkdir -p "$APPS"
-cat > "$DESKTOP" <<EOF
-[Desktop Entry]
-Type=Application
-Version=1.0
-Name=termset
-GenericName=Workspace Terminal
-Comment=Save your terminal layouts
-Exec=$BIN
-Path=$REPO
-Icon=termset
-Terminal=false
-Categories=System;TerminalEmulator;
-StartupWMClass=termset
-StartupNotify=true
-EOF
+sed -e "s|@BIN@|$BIN|g" \
+    -e "s|@WORKSPACE@|$WORKSPACE|g" \
+    -e "s|@PATH@|$HOME|g" \
+    "$DESKTOP_TEMPLATE" | grep -v '^#' > "$DESKTOP"
 chmod +x "$DESKTOP"
 log "entry -> $DESKTOP"
 
-# 4b. Clean up legacy artifacts from when the bin was named `mtm` and the
+# 5b. Clean up legacy artifacts from when the bin was named `mtm` and the
 #     launcher was `termem.desktop`. cargo leaves the old binary behind on a
 #     rename, and the dock/dash can stay pinned to the dead .desktop — so a
 #     taskbar click launches a stale build (or nothing). Remove both, and
@@ -133,12 +112,12 @@ if command -v dconf >/dev/null; then
     esac
 fi
 
-# 5. Refresh caches so the change shows up without a re-login.
+# 6. Refresh caches so the change shows up without a re-login.
 gtk-update-icon-cache -f -t "$ICON_BASE" >/dev/null 2>&1 || true
 update-desktop-database "$APPS"          >/dev/null 2>&1 || true
 # Mark the launcher trusted on GNOME (silences the "Allow Launching" prompt).
 command -v gio >/dev/null && gio set "$DESKTOP" metadata::trusted true >/dev/null 2>&1 || true
 
 echo
-echo "Done. 'termset' is now in your app grid / dock."
+echo "Done. 'termset' is now in your app grid / dock, opening $WORKSPACE."
 echo "If the icon doesn't refresh immediately, log out and back in."

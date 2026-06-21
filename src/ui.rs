@@ -39,7 +39,7 @@ pub(crate) const SIDEBAR_MARGIN: usize = 16; // fixed gap right of the longest l
 pub(crate) const SIDEBAR_PAD_L: usize = 6; // small left inset before each tree label
 pub(crate) const HEADER_H: usize = 16; // title bar; one content row tall (= cell_h at FONT_PX) for uniform heights
 pub(crate) const ROW_H: usize = 20; // context-menu item height
-pub(crate) const CTX_W: usize = 124; // context-menu width
+pub(crate) const CTX_W: usize = 150; // context-menu width (fits "Search Google")
 pub(crate) const RPANEL_W: usize = 252; // right inspector pane width
 pub(crate) const WBTN_W: usize = 30; // minimum sidebar width (also the old info-button width)
 pub(crate) const TLIGHT_CELL: usize = 18; // per-dot hit cell for the window controls
@@ -732,9 +732,9 @@ pub(crate) fn sidebar_row_tops(rows: &[Row], rh: usize) -> Vec<usize> {
     tops
 }
 
-/// A small bevelled two-item popup at the cursor (Start/Stop or Copy/Paste).
-/// `hovered` is the item the pointer is currently over (`Some(0|1)`), drawn with
-/// a highlight bar so the menu behaves like a normal hover/click menu.
+/// A small bevelled popup at the cursor, one row per item (e.g. Start/Stop,
+/// Copy/Paste/Search, or Open/Copy/Paste). `hovered` is the item the pointer is
+/// currently over, drawn with a highlight bar so it behaves like a normal menu.
 pub(crate) fn draw_ctx_menu(
     buf: &mut [u32],
     pw: usize,
@@ -742,10 +742,11 @@ pub(crate) fn draw_ctx_menu(
     r: &mut Renderer,
     x: usize,
     y: usize,
-    items: [&str; 2],
+    items: &[&str],
     hovered: Option<usize>,
 ) {
-    let h = ROW_H * 2 + 2;
+    let n = items.len().max(1);
+    let h = ROW_H * n + 2;
     vgradient(buf, pw, ph, x, y, CTX_W, h, PANEL_HI, PANEL_LO);
     stroke_rect(buf, pw, ph, x, y, CTX_W, h, BEVEL_DK);
     fill_rect(buf, pw, ph, x, y, CTX_W, 1, BEVEL_LT);
@@ -758,19 +759,22 @@ pub(crate) fn draw_ctx_menu(
         }
         draw_text(buf, pw, ph, r, x + 10, ry + ty, CTX_W - 12, label, INK);
     }
-    // Divider between the two items (drawn after, so the hover bar sits under it).
-    fill_rect(buf, pw, ph, x + 4, y + ROW_H, CTX_W - 8, 1, BEVEL_DK);
+    // Dividers between items (drawn after, so the hover bar sits under them).
+    for i in 1..items.len() {
+        fill_rect(buf, pw, ph, x + 4, y + i * ROW_H, CTX_W - 8, 1, BEVEL_DK);
+    }
 }
 
-/// Which context-menu item (if any) the point falls on. `0` = Start, `1` =
-/// Stop, `None` = outside the menu (dismiss).
+/// Which context-menu item (if any) the point falls on, or `None` when outside
+/// the menu (which dismisses it).
 pub(crate) fn ctx_item_at(m: &CtxMenu, x: f64, y: f64) -> Option<usize> {
+    let n = m.items.len().max(1);
     let (mx, my) = (m.x as f64, m.y as f64);
-    let h = (ROW_H * 2 + 2) as f64;
+    let h = (ROW_H * n + 2) as f64;
     if x < mx || x >= mx + CTX_W as f64 || y < my || y >= my + h {
         return None;
     }
-    Some(if (y - my) < ROW_H as f64 { 0 } else { 1 })
+    Some((((y - my) / ROW_H as f64) as usize).min(n - 1))
 }
 
 /// A Win2k push-button: raised by default, sunken+inset when `pressed`, dim

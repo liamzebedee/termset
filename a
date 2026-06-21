@@ -1,5 +1,0 @@
-groups:
-- name: Project
-  sessions:
-  - name: project2
-    dir: ~/Documents/projects/termem/project2
