@@ -1,0 +1,73 @@
+groups:
+- name: Apps
+  sessions:
+  - name: qwen
+    dir: ~/.apps
+    command: ./run-llama.sh
+  - name: dropbox
+    dir: ~/.apps
+    command: dropbox
+  - name: Apps 4
+    dir: ~/.apps
+- name: Music
+  sessions:
+  - name: Hermes chat
+    dir: ~/Music
+    command: hermes
+  - name: Wanted music
+    dir: ~/Music
+    command: nano wanted
+  - name: Music 3
+    dir: ~/Music
+  - name: Music 4
+    dir: ~/Music
+- name: Diabetes
+  sessions:
+  - name: Meal planner
+    dir: ~/Documents/projects/diabetes/mealplanner
+    command: bun run main.ts
+  - name: Sugar tracker
+    dir: ~/Documents/projects/diabetes/sugar
+    command: ./run.sh
+  - name: Diabetes 3
+    dir: ~/Documents/projects/diabetes/mealplanner
+    command: bash
+  - name: Diabetes 4
+    dir: ~/Documents/projects/diabetes/mealplanner
+  - name: Diabetes 5
+    dir: ~/Documents/projects/diabetes/mealplanner
+  - name: Diabetes 6
+    dir: ~/Documents/projects/diabetes/mealplanner
+- name: Terms
+  sessions:
+  - name: Terms 1
+    dir: ~/Documents/projects/terms
+    command: zsh
+  - name: Terms 2
+    dir: ~/Documents/projects/terms
+  - name: Terms 3
+    dir: ~/Documents/projects/terms
+  - name: Terms 4
+    dir: ~/Documents/projects/terms
+  - name: Terms 5
+    dir: ~/Documents/projects/terms
+- name: Morphology
+  sessions:
+  - name: morpheus
+    dir: ~/Documents/projects/morpheus
+    command: bash
+- name: HTGAA
+  sessions:
+  - name: website
+    dir: ~/Documents/projects/webpages
+    command: bash
+  - name: HTGAA 2
+    dir: ~/Documents/projects/webpages
+- name: Study
+  sessions:
+  - name: Papers
+    dir: ~/Documents/papers
+    command: bash
+  - name: Podcasts
+    dir: ~/Dropbox/Notes/Obsidian/consumption/Podcasts/podcast-learn
+    command: bash
